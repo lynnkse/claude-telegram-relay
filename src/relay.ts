@@ -30,37 +30,58 @@ const ALLOWED_USER_ID = process.env.TELEGRAM_USER_ID || "";
 const CLAUDE_PATH = process.env.CLAUDE_PATH || "claude";
 const PROJECT_DIR = process.env.PROJECT_DIR || "";
 const RELAY_DIR = process.env.RELAY_DIR || join(process.env.HOME || "~", ".claude-relay");
+const CHANNEL = process.env.CHANNEL || "telegram";
 
 // Directories
 const TEMP_DIR = join(RELAY_DIR, "temp");
 const UPLOADS_DIR = join(RELAY_DIR, "uploads");
-
-// Session tracking for conversation continuity
-const SESSION_FILE = join(RELAY_DIR, "session.json");
-
-interface SessionState {
-  sessionId: string | null;
-  lastActivity: string;
-}
+const SESSIONS_DIR = join(RELAY_DIR, "sessions");
 
 // ============================================================
-// SESSION MANAGEMENT
+// SESSION MANAGEMENT (Per-User, Persistent)
 // ============================================================
 
-async function loadSession(): Promise<SessionState> {
+async function getUserSession(userId: string): Promise<string | null> {
+  const sessionFile = join(SESSIONS_DIR, `${userId}.json`);
   try {
-    const content = await readFile(SESSION_FILE, "utf-8");
-    return JSON.parse(content);
+    const data = JSON.parse(await readFile(sessionFile, "utf-8"));
+    return data.sessionId;
   } catch {
-    return { sessionId: null, lastActivity: new Date().toISOString() };
+    return null; // No session yet
   }
 }
 
-async function saveSession(state: SessionState): Promise<void> {
-  await writeFile(SESSION_FILE, JSON.stringify(state, null, 2));
+async function saveUserSession(userId: string, sessionId: string): Promise<void> {
+  await mkdir(SESSIONS_DIR, { recursive: true });
+  const sessionFile = join(SESSIONS_DIR, `${userId}.json`);
+  await writeFile(sessionFile, JSON.stringify({ sessionId }, null, 2));
+  console.log(`Session saved for user ${userId}: ${sessionId.substring(0, 8)}...`);
 }
 
-let session = await loadSession();
+async function findLatestSession(): Promise<string | null> {
+  try {
+    const { readdirSync, statSync } = await import("fs");
+    const projectPath = PROJECT_DIR || process.cwd();
+    const projectName = projectPath.replace(/\//g, '-');
+    const sessionsDir = join(process.env.HOME || "~", ".claude", "projects", projectName);
+
+    const files = readdirSync(sessionsDir)
+      .filter(f => f.endsWith('.jsonl'))
+      .map(f => ({
+        name: f.replace('.jsonl', ''),
+        time: statSync(join(sessionsDir, f)).mtime.getTime()
+      }))
+      .sort((a, b) => b.time - a.time);
+
+    // Return newest if created within last 10 seconds
+    if (files[0] && Date.now() - files[0].time < 10000) {
+      return files[0].name;
+    }
+  } catch (error) {
+    console.error("Error finding latest session:", error);
+  }
+  return null;
+}
 
 // ============================================================
 // LOCK FILE (prevent multiple instances)
@@ -146,7 +167,7 @@ async function saveMessage(
     await supabase.from("messages").insert({
       role,
       content,
-      channel: "telegram",
+      channel: CHANNEL,
       metadata: metadata || {},
     });
   } catch (error) {
@@ -185,13 +206,19 @@ bot.use(async (ctx, next) => {
 
 async function callClaude(
   prompt: string,
+  userId: string,
   options?: { resume?: boolean; imagePath?: string }
 ): Promise<string> {
-  const args = [CLAUDE_PATH, "-p", prompt];
+  // Use node to run claude (Bun doesn't handle shebangs well)
+  const args = ["node", CLAUDE_PATH, "-p", prompt];
 
-  // Resume previous session if available and requested
-  if (options?.resume && session.sessionId) {
-    args.push("--resume", session.sessionId);
+  // Resume user's session if it exists
+  if (options?.resume) {
+    const sessionId = await getUserSession(userId);
+    if (sessionId) {
+      args.push("--resume", sessionId);
+      console.log(`Resuming session: ${sessionId.substring(0, 8)}...`);
+    }
   }
 
   args.push("--output-format", "text");
@@ -205,7 +232,7 @@ async function callClaude(
       cwd: PROJECT_DIR || undefined,
       env: {
         ...process.env,
-        // Pass through any env vars Claude might need
+        CLAUDECODE: undefined, // Allow nested Claude sessions
       },
     });
 
@@ -219,12 +246,10 @@ async function callClaude(
       return `Error: ${stderr || "Claude exited with code " + exitCode}`;
     }
 
-    // Extract session ID from output if present (for --resume)
-    const sessionMatch = output.match(/Session ID: ([a-f0-9-]+)/i);
-    if (sessionMatch) {
-      session.sessionId = sessionMatch[1];
-      session.lastActivity = new Date().toISOString();
-      await saveSession(session);
+    // Save session ID for next message (find newest session file)
+    const newSessionId = await findLatestSession();
+    if (newSessionId) {
+      await saveUserSession(userId, newSessionId);
     }
 
     return output.trim();
@@ -241,7 +266,8 @@ async function callClaude(
 // Text messages
 bot.on("message:text", async (ctx) => {
   const text = ctx.message.text;
-  console.log(`Message: ${text.substring(0, 50)}...`);
+  const userId = ctx.from?.id.toString() || ALLOWED_USER_ID;
+  console.log(`Message from ${userId}: ${text.substring(0, 50)}...`);
 
   await ctx.replyWithChatAction("typing");
 
@@ -254,7 +280,7 @@ bot.on("message:text", async (ctx) => {
   ]);
 
   const enrichedPrompt = buildPrompt(text, relevantContext, memoryContext);
-  const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+  const rawResponse = await callClaude(enrichedPrompt, userId, { resume: true });
 
   // Parse and save any memory intents, strip tags from response
   const response = await processMemoryIntents(supabase, rawResponse);
@@ -266,7 +292,8 @@ bot.on("message:text", async (ctx) => {
 // Voice messages
 bot.on("message:voice", async (ctx) => {
   const voice = ctx.message.voice;
-  console.log(`Voice message: ${voice.duration}s`);
+  const userId = ctx.from?.id.toString() || ALLOWED_USER_ID;
+  console.log(`Voice message from ${userId}: ${voice.duration}s`);
   await ctx.replyWithChatAction("typing");
 
   if (!process.env.VOICE_PROVIDER) {
@@ -301,7 +328,7 @@ bot.on("message:voice", async (ctx) => {
       relevantContext,
       memoryContext
     );
-    const rawResponse = await callClaude(enrichedPrompt, { resume: true });
+    const rawResponse = await callClaude(enrichedPrompt, userId, { resume: true });
     const claudeResponse = await processMemoryIntents(supabase, rawResponse);
 
     await saveMessage("assistant", claudeResponse);
@@ -314,7 +341,8 @@ bot.on("message:voice", async (ctx) => {
 
 // Photos/Images
 bot.on("message:photo", async (ctx) => {
-  console.log("Image received");
+  const userId = ctx.from?.id.toString() || ALLOWED_USER_ID;
+  console.log(`Image received from ${userId}`);
   await ctx.replyWithChatAction("typing");
 
   try {
@@ -339,7 +367,7 @@ bot.on("message:photo", async (ctx) => {
 
     await saveMessage("user", `[Image]: ${caption}`);
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await callClaude(prompt, userId, { resume: true });
 
     // Cleanup after processing
     await unlink(filePath).catch(() => {});
@@ -356,7 +384,8 @@ bot.on("message:photo", async (ctx) => {
 // Documents
 bot.on("message:document", async (ctx) => {
   const doc = ctx.message.document;
-  console.log(`Document: ${doc.file_name}`);
+  const userId = ctx.from?.id.toString() || ALLOWED_USER_ID;
+  console.log(`Document from ${userId}: ${doc.file_name}`);
   await ctx.replyWithChatAction("typing");
 
   try {
@@ -376,7 +405,7 @@ bot.on("message:document", async (ctx) => {
 
     await saveMessage("user", `[Document: ${doc.file_name}]: ${caption}`);
 
-    const claudeResponse = await callClaude(prompt, { resume: true });
+    const claudeResponse = await callClaude(prompt, userId, { resume: true });
 
     await unlink(filePath).catch(() => {});
 
@@ -438,6 +467,18 @@ function buildPrompt(
       "\n[GOAL: goal text | DEADLINE: optional date]" +
       "\n[DONE: search text for completed goal]"
   );
+
+  if (PROJECT_DIR) {
+    parts.push(
+      "\nTASK MANAGEMENT:" +
+        `\nYou can read and edit the project TODO file at: ${PROJECT_DIR}/.claude/TODO.md` +
+        "\nUse the Read tool to check current tasks, then Edit to update the file when:" +
+        "\n- User marks a task as done → change [ ] to [x], add completion date and brief outcome" +
+        "\n- User asks to add a new task → append it under the appropriate section" +
+        "\n- User changes a task's priority, details, or status" +
+        "\nAlways confirm to the user what you changed in the file."
+    );
+  }
 
   parts.push(`\nUser: ${userMessage}`);
 
