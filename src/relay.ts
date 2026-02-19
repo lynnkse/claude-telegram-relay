@@ -221,7 +221,7 @@ async function callClaude(
     }
   }
 
-  args.push("--output-format", "text");
+  args.push("--output-format", "json");
 
   console.log(`Calling Claude: ${prompt.substring(0, 50)}...`);
 
@@ -246,13 +246,14 @@ async function callClaude(
       return `Error: ${stderr || "Claude exited with code " + exitCode}`;
     }
 
-    // Save session ID for next message (find newest session file)
-    const newSessionId = await findLatestSession();
-    if (newSessionId) {
-      await saveUserSession(userId, newSessionId);
+    // Parse JSON response to get session_id and result text directly
+    const parsed = JSON.parse(output);
+    if (parsed.session_id) {
+      await saveUserSession(userId, parsed.session_id);
+      console.log(`Session saved: ${parsed.session_id.substring(0, 8)}...`);
     }
 
-    return output.trim();
+    return (parsed.result || "").trim();
   } catch (error) {
     console.error("Spawn error:", error);
     return `Error: Could not run Claude CLI`;
