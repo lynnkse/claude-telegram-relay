@@ -53,6 +53,7 @@ USER_INPUT_SOCK: str = f"{SOCKET_DIR}/user_input.sock"
 CLAUDE_RESPONSE_SOCK: str = f"{SOCKET_DIR}/claude_response.sock"
 DISPLAY_SOCK: str = f"{SOCKET_DIR}/display.sock"
 CLI_INPUT_SOCK: str = f"{SOCKET_DIR}/cli_input.sock"
+PERMISSION_SOCK: str = f"{SOCKET_DIR}/permission.sock"
 
 # Runtime state dir
 RELAY_DIR: str = get("RELAY_DIR", str(Path.home() / ".claude-relay"))

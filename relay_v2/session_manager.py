@@ -93,6 +93,12 @@ class SessionManagerNode:
         # Epoch time of most recent Claude spawn — used to filter session files
         self._spawn_time: float = 0.0
 
+        # Permission request state
+        # When a PermissionRequest hook connects, we hold its connection here
+        # until a decision arrives (from Telegram or CLI).
+        self._permission_conn: Optional[socket.socket] = None
+        self._permission_lock = threading.Lock()
+
         self._running = True
         self._reader_thread: Optional[threading.Thread] = None
 
@@ -569,12 +575,18 @@ class SessionManagerNode:
                         continue
                     try:
                         msg = json.loads(line)
-                        self.input_queue.put(QueueItem(
-                            text=msg["text"],
-                            source=msg.get("source", "unknown"),
-                            user_id=msg.get("user_id", ""),
-                            media_path=msg.get("media_path"),
-                        ))
+                        if msg.get("type") == "permission_response":
+                            self._resolve_permission(
+                                msg.get("decision", "deny"),
+                                msg.get("message", ""),
+                            )
+                        else:
+                            self.input_queue.put(QueueItem(
+                                text=msg["text"],
+                                source=msg.get("source", "unknown"),
+                                user_id=msg.get("user_id", ""),
+                                media_path=msg.get("media_path"),
+                            ))
                     except (json.JSONDecodeError, KeyError) as e:
                         log.warning(f"Bad input message: {e}")
 
@@ -642,10 +654,15 @@ class SessionManagerNode:
     def _route_keyboard_bytes(self, data: bytes):
         with self.state_lock:
             generating = self.state == "GENERATING"
-            if generating:
+
+        with self._permission_lock:
+            permission_pending = self._permission_conn is not None
+
+        if generating and not permission_pending:
+            with self.state_lock:
                 self.keyboard_buffer.append(data)
-            else:
-                self._write_to_pty(data)
+        else:
+            self._write_to_pty(data)
 
     def _display_server_thread(self):
         sock_path = config.DISPLAY_SOCK
@@ -689,6 +706,124 @@ class SessionManagerNode:
                     self.response_subscribers.append(conn)
             except Exception:
                 break
+
+    def _permission_server_thread(self):
+        """
+        Listens for connections from permission_hook.py.
+
+        Each connection carries one permission request (NDJSON line).
+        We hold the connection open, broadcast the request to all response
+        subscribers (TelegramNode, etc.), and wait for a decision.
+        The decision arrives either via _handle_input_conn (from TelegramNode's
+        callback) or is sent directly to the held connection by
+        _resolve_permission().
+        """
+        sock_path = config.PERMISSION_SOCK
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(sock_path)
+        server.listen(1)
+        log.info("permission.sock listening")
+
+        while self._running:
+            try:
+                conn, _ = server.accept()
+                threading.Thread(
+                    target=self._handle_permission_conn, args=(conn,), daemon=True
+                ).start()
+            except Exception:
+                break
+
+    def _handle_permission_conn(self, conn: socket.socket):
+        """Read one permission request, hold conn open until decision arrives."""
+        buf = b""
+        try:
+            conn.settimeout(10)
+            while b"\n" not in buf:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    return
+                buf += chunk
+            conn.settimeout(None)
+        except Exception as e:
+            log.warning(f"Permission hook read error: {e}")
+            conn.close()
+            return
+
+        line = buf.split(b"\n")[0].strip()
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            log.warning("Permission hook: bad JSON")
+            conn.close()
+            return
+
+        tool_name = request.get("tool_name", "unknown")
+        tool_input = request.get("tool_input", {})
+        log.info(f"Permission request: {tool_name} {str(tool_input)[:80]}")
+
+        with self._permission_lock:
+            if self._permission_conn is not None:
+                # Concurrent request — shouldn't happen with a serial queue,
+                # but just in case: deny and close the old one.
+                log.warning("Permission request arrived while one is pending — denying old")
+                try:
+                    self._permission_conn.sendall(
+                        json.dumps({"decision": "deny", "message": "Superseded."}).encode() + b"\n"
+                    )
+                    self._permission_conn.close()
+                except Exception:
+                    pass
+            self._permission_conn = conn
+
+        # Broadcast to all subscribers so TelegramNode can show inline buttons
+        self._publish_permission_request(tool_name, tool_input)
+
+        # The connection is now held open; _resolve_permission() will close it
+        # when the decision arrives.
+
+    def _publish_permission_request(self, tool_name: str, tool_input: dict):
+        payload = json.dumps({
+            "type": "permission_request",
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        }) + "\n"
+        payload_bytes = payload.encode()
+        with self.response_subs_lock:
+            dead = []
+            for conn in self.response_subscribers:
+                try:
+                    conn.sendall(payload_bytes)
+                except Exception:
+                    dead.append(conn)
+            for conn in dead:
+                self.response_subscribers.remove(conn)
+
+    def _resolve_permission(self, decision: str, message: str = ""):
+        """
+        Called when the user makes a permission decision (allow/deny).
+        Sends the response to the waiting permission_hook.py connection.
+        """
+        with self._permission_lock:
+            conn = self._permission_conn
+            self._permission_conn = None
+
+        if conn is None:
+            log.warning("_resolve_permission called but no pending permission request")
+            return
+
+        payload = {"decision": decision}
+        if message:
+            payload["message"] = message
+        try:
+            conn.sendall((json.dumps(payload) + "\n").encode())
+            conn.close()
+        except Exception as e:
+            log.warning(f"Failed to send permission decision: {e}")
+
+        log.info(f"Permission resolved: {decision}")
 
     # ------------------------------------------------------------------
     # Lock file
@@ -738,6 +873,7 @@ class SessionManagerNode:
             threading.Thread(target=self._cli_input_server_thread, daemon=True),
             threading.Thread(target=self._display_server_thread, daemon=True),
             threading.Thread(target=self._response_server_thread, daemon=True),
+            threading.Thread(target=self._permission_server_thread, daemon=True),
         ]
         for t in threads:
             t.start()
@@ -771,6 +907,7 @@ class SessionManagerNode:
             config.CLI_INPUT_SOCK,
             config.DISPLAY_SOCK,
             config.CLAUDE_RESPONSE_SOCK,
+            config.PERMISSION_SOCK,
         ]:
             try:
                 os.unlink(sock_path)

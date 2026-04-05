@@ -33,9 +33,10 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -142,12 +143,15 @@ def _send_to_session_manager(text: str, source: str, user_id: str, media_path: O
 class ResponseSubscriber:
     """
     Maintains a persistent connection to claude_response.sock.
-    Runs in a background thread, puts decoded responses onto an asyncio queue.
+    Routes messages to two queues:
+      _response_queue   — normal {text, source, user_id} messages
+      _permission_queue — {type:"permission_request", tool_name, tool_input} messages
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
-        self._queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._response_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._permission_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._thread = threading.Thread(target=self._reader_thread, daemon=True)
         self._thread.start()
 
@@ -173,9 +177,14 @@ class ResponseSubscriber:
                             continue
                         try:
                             msg = json.loads(line)
-                            self._loop.call_soon_threadsafe(
-                                self._queue.put_nowait, msg
-                            )
+                            if msg.get("type") == "permission_request":
+                                self._loop.call_soon_threadsafe(
+                                    self._permission_queue.put_nowait, msg
+                                )
+                            else:
+                                self._loop.call_soon_threadsafe(
+                                    self._response_queue.put_nowait, msg
+                                )
                         except json.JSONDecodeError as e:
                             log.warning(f"Bad response JSON: {e}")
             except Exception as e:
@@ -188,7 +197,10 @@ class ResponseSubscriber:
             time.sleep(3)
 
     async def get(self) -> dict:
-        return await self._queue.get()
+        return await self._response_queue.get()
+
+    async def get_permission(self) -> dict:
+        return await self._permission_queue.get()
 
 
 # ── Core handler logic ────────────────────────────────────────────────────────
@@ -267,6 +279,71 @@ async def _handle_and_reply(
             os.unlink(media_path)
         except Exception:
             pass
+
+
+# ── Permission request handling ───────────────────────────────────────────────
+
+def _send_permission_response(decision: str):
+    """Send allow/deny decision back to SessionManagerNode."""
+    msg = {"type": "permission_response", "decision": decision}
+    payload = (json.dumps(msg) + "\n").encode()
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(config.USER_INPUT_SOCK)
+        sock.sendall(payload)
+        sock.close()
+    except Exception as e:
+        log.error(f"Failed to send permission response: {e}")
+
+
+def _format_permission_message(tool_name: str, tool_input: dict) -> str:
+    lines = [f"Claude wants to use: *{tool_name}*"]
+    # Show the most relevant field(s) for common tools
+    if "command" in tool_input:
+        lines.append(f"`{tool_input['command'][:200]}`")
+    elif "file_path" in tool_input:
+        lines.append(f"`{tool_input['file_path']}`")
+    elif tool_input:
+        # Show first field as fallback
+        key, val = next(iter(tool_input.items()))
+        lines.append(f"`{key}: {str(val)[:200]}`")
+    lines.append("\nAllow?")
+    return "\n".join(lines)
+
+
+async def _permission_dispatcher(
+    subscriber: ResponseSubscriber,
+    bot,
+    authorized_user_id: str,
+):
+    """
+    Background task: reads permission requests from the subscriber and
+    sends an inline keyboard to the authorized user.
+    """
+    while True:
+        msg = await subscriber.get_permission()
+        tool_name = msg.get("tool_name", "unknown")
+        tool_input = msg.get("tool_input", {})
+        log.info(f"Sending permission request to Telegram: {tool_name}")
+
+        text = _format_permission_message(tool_name, tool_input)
+        keyboard = InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton("Allow", callback_data="perm:allow"),
+                InlineKeyboardButton("Deny", callback_data="perm:deny"),
+            ]
+        ])
+        try:
+            await bot.send_message(
+                chat_id=authorized_user_id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            log.error(f"Failed to send permission request to Telegram: {e}")
+            # Auto-deny so Claude isn't stuck
+            _send_permission_response("deny")
 
 
 # ── Message handlers ──────────────────────────────────────────────────────────
@@ -368,6 +445,30 @@ def main():
         application.add_handler(MessageHandler(filters.VOICE, on_voice))
         application.add_handler(MessageHandler(filters.PHOTO, on_photo))
         application.add_handler(MessageHandler(filters.Document.ALL, on_document))
+
+        # Permission inline keyboard handler
+        async def on_permission_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            await query.answer()
+            if not AUTHORIZED_USER_ID or str(query.from_user.id) == AUTHORIZED_USER_ID:
+                decision = "allow" if query.data == "perm:allow" else "deny"
+                _send_permission_response(decision)
+                label = "Allowed" if decision == "allow" else "Denied"
+                await query.edit_message_reply_markup(reply_markup=None)
+                await query.edit_message_text(
+                    query.message.text + f"\n\n_{label}_",
+                    parse_mode="Markdown",
+                )
+                log.info(f"Permission {decision} via Telegram button")
+
+        application.add_handler(CallbackQueryHandler(on_permission_callback, pattern="^perm:"))
+
+        # Start permission dispatcher as a background asyncio task
+        if AUTHORIZED_USER_ID:
+            loop.create_task(
+                _permission_dispatcher(subscriber, application.bot, AUTHORIZED_USER_ID)
+            )
+
         log.info(f"TelegramNode starting (authorized user: {AUTHORIZED_USER_ID or 'ANY'})")
 
     app = Application.builder().token(token).post_init(post_init).build()
