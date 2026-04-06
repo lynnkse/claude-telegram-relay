@@ -1,0 +1,15 @@
+{
+  "hooks": {
+    "PermissionRequest": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 /home/lynnkse/cognitive-hq/claude-telegram-relay/relay_v2/permission_hook.py"
+          }
+        ]
+      }
+    ]
+  }
+}

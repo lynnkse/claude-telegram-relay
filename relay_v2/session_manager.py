@@ -576,6 +576,7 @@ class SessionManagerNode:
                     try:
                         msg = json.loads(line)
                         if msg.get("type") == "permission_response":
+                            log.info(f"permission_response received: decision={msg.get('decision')!r}")
                             self._resolve_permission(
                                 msg.get("decision", "deny"),
                                 msg.get("message", ""),
@@ -810,6 +811,7 @@ class SessionManagerNode:
             conn = self._permission_conn
             self._permission_conn = None
 
+        log.info(f"_resolve_permission: decision={decision!r} conn={conn}")
         if conn is None:
             log.warning("_resolve_permission called but no pending permission request")
             return

@@ -203,6 +203,21 @@ class ResponseSubscriber:
         return await self._permission_queue.get()
 
 
+# ── Permission debug log ──────────────────────────────────────────────────────
+
+_PLOG_FILE = "/tmp/telegram_permission.log"
+
+def _plog(msg: str):
+    from datetime import datetime
+    line = f"{datetime.now().strftime('%H:%M:%S.%f')[:-3]} [telegram] {msg}\n"
+    log.info(f"[perm] {msg}")
+    try:
+        with open(_PLOG_FILE, "a") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
 # ── Core handler logic ────────────────────────────────────────────────────────
 
 AUTHORIZED_USER_ID = config.get("TELEGRAM_USER_ID")
@@ -287,13 +302,16 @@ def _send_permission_response(decision: str):
     """Send allow/deny decision back to SessionManagerNode."""
     msg = {"type": "permission_response", "decision": decision}
     payload = (json.dumps(msg) + "\n").encode()
+    _plog(f"sending permission_response decision={decision} to {config.USER_INPUT_SOCK}")
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.connect(config.USER_INPUT_SOCK)
         sock.sendall(payload)
         sock.close()
+        _plog("permission_response sent OK")
     except Exception as e:
         log.error(f"Failed to send permission response: {e}")
+        _plog(f"ERROR sending permission_response: {e}")
 
 
 def _format_permission_message(tool_name: str, tool_input: dict) -> str:
@@ -449,17 +467,19 @@ def main():
         # Permission inline keyboard handler
         async def on_permission_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query = update.callback_query
+            _plog(f"callback received: data={query.data!r} from_user={query.from_user.id}")
             await query.answer()
-            if not AUTHORIZED_USER_ID or str(query.from_user.id) == AUTHORIZED_USER_ID:
+            auth_ok = not AUTHORIZED_USER_ID or str(query.from_user.id) == AUTHORIZED_USER_ID
+            _plog(f"auth_ok={auth_ok} AUTHORIZED_USER_ID={AUTHORIZED_USER_ID!r}")
+            if auth_ok:
                 decision = "allow" if query.data == "perm:allow" else "deny"
                 _send_permission_response(decision)
-                label = "Allowed" if decision == "allow" else "Denied"
-                await query.edit_message_reply_markup(reply_markup=None)
-                await query.edit_message_text(
-                    query.message.text + f"\n\n_{label}_",
-                    parse_mode="Markdown",
-                )
                 log.info(f"Permission {decision} via Telegram button")
+                label = "✓ Allowed" if decision == "allow" else "✗ Denied"
+                try:
+                    await query.edit_message_text(label)
+                except Exception as e:
+                    log.warning(f"Could not edit permission message: {e}")
 
         application.add_handler(CallbackQueryHandler(on_permission_callback, pattern="^perm:"))
 
