@@ -11,21 +11,22 @@ Claude Code protocol:
   stdout — JSON with hookSpecificOutput.decision.behavior = "allow"|"deny"
   exit 0 always (non-zero = error, Claude Code falls back to TUI)
 
-Timeout: if SessionManagerNode is not running or user doesn't respond
-within TIMEOUT seconds, we fall through by exiting non-zero so Claude
-Code shows its normal TUI dialog.
+Timeout: retries up to MAX_RETRIES times (ATTEMPT_TIMEOUT seconds each),
+re-broadcasting the inline keyboard on every retry. After all attempts
+exhausted, denies cleanly (exit 0 with deny) rather than falling to TUI.
+If SessionManagerNode is not reachable at all, falls through to TUI (exit 1).
 """
 
 import json
 import os
 import socket
 import sys
-import time
 from datetime import datetime
 
 # Must match config.py
 PERMISSION_SOCK = "/tmp/cognitive-hq/permission.sock"
-TIMEOUT = 120  # seconds to wait for user decision
+ATTEMPT_TIMEOUT = 120  # seconds to wait per attempt
+MAX_RETRIES = 3       # deny after this many unanswered attempts
 LOG_FILE = "/tmp/permission_hook.log"
 
 
@@ -58,6 +59,53 @@ def _deny(message: str = "Denied via Telegram relay.") -> dict:
     }
 
 
+def _try_once(request: dict) -> str | None:
+    """
+    Open a fresh connection to permission.sock, send the request, and wait
+    up to ATTEMPT_TIMEOUT seconds for a decision.
+
+    Returns "allow" or "deny" on success, None on timeout or connection error.
+    Each call causes SessionManagerNode to re-broadcast the inline keyboard.
+    """
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(5)
+        sock.connect(PERMISSION_SOCK)
+        _log("connected to permission.sock")
+
+        payload = (json.dumps(request) + "\n").encode()
+        sock.sendall(payload)
+        _log("request sent, waiting for decision...")
+
+        sock.settimeout(ATTEMPT_TIMEOUT)
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(256)
+            if not chunk:
+                _log("socket closed by server before decision")
+                return None
+            buf += chunk
+
+        line = buf.split(b"\n")[0].strip()
+        _log(f"received: {line.decode()}")
+        response = json.loads(line)
+        return response.get("decision", "deny")
+
+    except socket.timeout:
+        _log("attempt timed out")
+        return None
+    except Exception as e:
+        _log(f"ERROR: {e}")
+        return None
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except Exception:
+                pass
+
+
 def main():
     # Only intercept permissions for the relay's own Claude session.
     # Other Claude Code sessions on this machine exit immediately so their
@@ -75,60 +123,30 @@ def main():
         _log(f"ERROR reading stdin: {e}")
         sys.exit(1)  # fall through to TUI
 
-    try:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(5)
-        sock.connect(PERMISSION_SOCK)
-        _log("connected to permission.sock")
-    except Exception as e:
-        _log(f"ERROR connecting to permission.sock: {e} — falling through to TUI")
-        sys.exit(1)  # fall through to TUI
+    for attempt in range(1, MAX_RETRIES + 1):
+        _log(f"attempt {attempt}/{MAX_RETRIES}")
+        decision = _try_once(request)
 
-    try:
-        payload = (json.dumps(request) + "\n").encode()
-        sock.sendall(payload)
-        _log("request sent, waiting for decision...")
+        if decision is not None:
+            if decision == "allow":
+                output = json.dumps(_allow())
+            else:
+                output = json.dumps(_deny("Denied via Telegram relay."))
+            _log(f"stdout: {output}")
+            print(output)
+            sys.stdout.flush()
+            _log("=== permission_hook done (exit 0) ===")
+            sys.exit(0)
 
-        # Wait for decision
-        sock.settimeout(TIMEOUT)
-        buf = b""
-        while b"\n" not in buf:
-            chunk = sock.recv(256)
-            if not chunk:
-                _log("socket closed by server before decision")
-                break
-            buf += chunk
+        _log(f"attempt {attempt} timed out — {'retrying' if attempt < MAX_RETRIES else 'giving up'}")
 
-        sock.close()
-
-        if not buf.strip():
-            _log("ERROR: empty response from server — falling through to TUI")
-            sys.exit(1)
-
-        line = buf.split(b"\n")[0].strip()
-        _log(f"received: {line.decode()}")
-        response = json.loads(line)
-        decision = response.get("decision", "deny")
-        _log(f"decision: {decision}")
-
-        if decision == "allow":
-            output = json.dumps(_allow())
-        else:
-            output = json.dumps(_deny(response.get("message", "Denied via Telegram relay.")))
-
-        _log(f"stdout: {output}")
-        print(output)
-        sys.stdout.flush()
-        _log("=== permission_hook done (exit 0) ===")
-        sys.exit(0)
-
-    except Exception as e:
-        _log(f"ERROR in decision loop: {e}")
-        try:
-            sock.close()
-        except Exception:
-            pass
-        sys.exit(1)  # fall through to TUI
+    # All attempts exhausted: deny cleanly (no TUI fallback)
+    _log("All attempts exhausted — defaulting to deny")
+    output = json.dumps(_deny("No response after 3 attempts — denied automatically."))
+    print(output)
+    sys.stdout.flush()
+    _log("=== permission_hook done (exit 0 / auto-deny) ===")
+    sys.exit(0)
 
 
 if __name__ == "__main__":

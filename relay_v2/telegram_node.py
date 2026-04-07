@@ -468,13 +468,21 @@ def main():
         async def on_permission_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query = update.callback_query
             _plog(f"callback received: data={query.data!r} from_user={query.from_user.id}")
-            await query.answer()
+
+            # Send permission decision FIRST, before any await that could fail
             auth_ok = not AUTHORIZED_USER_ID or str(query.from_user.id) == AUTHORIZED_USER_ID
             _plog(f"auth_ok={auth_ok} AUTHORIZED_USER_ID={AUTHORIZED_USER_ID!r}")
             if auth_ok:
                 decision = "allow" if query.data == "perm:allow" else "deny"
                 _send_permission_response(decision)
                 log.info(f"Permission {decision} via Telegram button")
+
+            # Now handle Telegram UI updates (non-critical)
+            try:
+                await query.answer()
+            except Exception:
+                pass
+            if auth_ok:
                 label = "✓ Allowed" if decision == "allow" else "✗ Denied"
                 try:
                     await query.edit_message_text(label)
@@ -491,7 +499,7 @@ def main():
 
         log.info(f"TelegramNode starting (authorized user: {AUTHORIZED_USER_ID or 'ANY'})")
 
-    app = Application.builder().token(token).post_init(post_init).build()
+    app = Application.builder().token(token).concurrent_updates(True).post_init(post_init).build()
     app.run_polling()
 
 
