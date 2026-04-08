@@ -61,3 +61,13 @@ Added `_auto_decision()` to `permission_hook.py`. Runs before connecting to `per
 **Bug fixed:** heredoc content containing dangerous-looking strings (e.g. "git reset --hard" in a log entry) was incorrectly triggering the ask-user path. Now only the first line (the actual shell command) is pattern-matched.
 
 Logged to `/tmp/permission_hook.log` with `AUTO-ALLOW:` prefix for audit trail.
+
+## 2026-04-08 — Fix missing final Telegram response after multi-tool runs
+
+**Symptom:** After multiple permission approvals, CLI showed the summary but Telegram received nothing.
+
+**Root cause:** `_RESPONSE_TIMEOUT` was 180s. Multi-tool runs with several 30-60s permission prompts exceeded this, causing the JSONL poller to time out and return a timeout message (or the actual response arrived after the poller had already given up).
+
+**Fix 1:** Raised `_RESPONSE_TIMEOUT` to 600s (10 minutes).
+
+**Fix 2:** Added `_STALL_FALLBACK` (30s): if the JSONL file stops growing but the last entry is not "text" type, return the best text we have rather than waiting for deadline. Handles edge case where Claude finishes without a closing text message.
