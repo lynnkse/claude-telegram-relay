@@ -19,15 +19,86 @@ If SessionManagerNode is not reachable at all, falls through to TUI (exit 1).
 
 import json
 import os
+import re
 import socket
 import sys
 from datetime import datetime
+from pathlib import Path
 
 # Must match config.py
 PERMISSION_SOCK = "/tmp/cognitive-hq/permission.sock"
 ATTEMPT_TIMEOUT = 120  # seconds to wait per attempt
 MAX_RETRIES = 3       # deny after this many unanswered attempts
 LOG_FILE = "/tmp/permission_hook.log"
+
+# Paths that are never auto-allowed for writes, even within home dir
+_SENSITIVE_PATHS = (
+    "/.ssh/", "/.aws/", "/.gnupg/", "/.config/", "/etc/",
+    "/.netrc", "/.npmrc", "/.pypirc",
+)
+
+# Bash patterns that are never auto-allowed regardless of other rules
+_DANGEROUS_BASH = re.compile(
+    r"\bsudo\b"
+    r"|rm\s+-[a-z]*r[a-z]*f\b"          # rm -rf (any path)
+    r"|rm\s+--force"
+    r"|git\s+reset\s+--hard"
+    r"|git\s+push\s+(--force|-f)"
+    r"|\bdd\b.+of=/"                    # dd writing to disk
+    r"|\bmkfs\b"
+    r"|\bfdisk\b|\bparted\b"
+    r"|>\s*/dev/sd"                      # writing to block device
+    r"|:\(\)\{.*\}.*:"                   # fork bomb
+    r"|chmod\s+[0-7]*7[0-7]*\s+/"       # chmod 777 /...
+    r"|chown\s+.+\s+/"
+    r"|mv\s+.+\s+/dev/null",
+    re.IGNORECASE,
+)
+
+
+def _auto_decision(tool_name: str, tool_input: dict) -> str | None:
+    """
+    Fast pre-check before asking the user.
+
+    Returns "allow" (safe to proceed automatically),
+            "deny"  (clearly unsafe, block immediately), or
+            None    (ambiguous — ask via Telegram as usual).
+
+    Controlled by CLAUDE_AUTO_ALLOW env var:
+      unset / "1" / "true"  → auto-allow logic active (default)
+      "0" / "false"         → always ask user (disables auto-allow)
+    """
+    auto = os.environ.get("CLAUDE_AUTO_ALLOW", "1").lower()
+    if auto in ("0", "false", "no", "off"):
+        return None
+
+    # ── Always-safe read-only tools ───────────────────────────────────────
+    if tool_name in ("Read", "Glob", "Grep", "LS", "NotebookRead"):
+        return "allow"
+
+    # ── Web browsing ──────────────────────────────────────────────────────
+    if tool_name in ("WebFetch", "WebSearch"):
+        return "allow"
+
+    # ── File writes: allow within home dir, block sensitive paths ─────────
+    if tool_name in ("Edit", "Write", "NotebookEdit", "Create"):
+        file_path = tool_input.get("file_path", "")
+        home = str(Path.home())
+        if not file_path.startswith(home):
+            return None  # outside home — ask
+        if any(s in file_path for s in _SENSITIVE_PATHS):
+            return None  # sensitive path — ask
+        return "allow"
+
+    # ── Bash: block known-dangerous patterns, allow everything else ────────
+    if tool_name == "Bash":
+        command = tool_input.get("command", "")
+        if _DANGEROUS_BASH.search(command):
+            return None  # ask user — don't auto-deny, let them decide
+        return "allow"
+
+    # Unknown tool — ask
+    return None
 
 
 def _log(msg: str):
@@ -130,6 +201,22 @@ def main():
         _log(f"ERROR reading stdin: {e}")
         sys.exit(1)  # fall through to TUI
 
+    tool_name  = request.get("tool_name", "")
+    tool_input = request.get("tool_input", {})
+
+    auto = _auto_decision(tool_name, tool_input)
+    if auto == "allow":
+        _log(f"AUTO-ALLOW: {tool_name}")
+        print(json.dumps(_allow()))
+        sys.stdout.flush()
+        sys.exit(0)
+    if auto == "deny":
+        _log(f"AUTO-DENY: {tool_name}")
+        print(json.dumps(_deny("Auto-denied: unsafe operation.")))
+        sys.stdout.flush()
+        sys.exit(0)
+
+    _log(f"asking user: {tool_name}")
     for attempt in range(1, MAX_RETRIES + 1):
         _log(f"attempt {attempt}/{MAX_RETRIES}")
         decision = _try_once(request)
