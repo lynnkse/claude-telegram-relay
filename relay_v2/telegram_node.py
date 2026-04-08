@@ -551,7 +551,7 @@ def _make_slash_handlers():
                         try:
                             obj  = json.loads(line)
                             ts   = _parse_ts(obj.get("timestamp"))
-                            usage = obj.get("usage")
+                            usage = obj.get("message", {}).get("usage")
                             if not usage or ts is None:
                                 continue
                             inp = usage.get("input_tokens", 0)
