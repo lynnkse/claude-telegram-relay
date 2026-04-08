@@ -25,3 +25,25 @@ app = Application.builder().token(token).concurrent_updates(True).post_init(post
 
 ### Known issue
 `CLAUDE_RELAY_SESSION=1` leaks into interactive terminal sessions if started from the same shell as the relay. Need to ensure wrapper-set env var doesn't pollute interactive Claude Code sessions. Mitigation: use a separate terminal or `unset CLAUDE_RELAY_SESSION` before interactive use.
+
+## 2026-04-08 — Telegram slash commands + permission hook fallback fix
+
+### Slash commands implemented
+Intercepted via python-telegram-bot `CommandHandler` before reaching Claude PTY.
+All read local files directly — no Claude involvement, instant replies.
+
+- `/help` — lists commands
+- `/status` — relay health (SessionManager PID, session ID, sockets)
+- `/usage` — 5h window + 7-day totals from session JSONL, timezone-aware reset times (USER_TIMEZONE), countdown ("in 2h 15m"), % display when USAGE_*_LIMIT set in .env
+- `/model` — current Claude model from session JSONL
+- `/clear` — deletes session ID file (fresh session on next restart)
+
+**Bug found during /usage:** usage data is in `obj['message']['usage']`, not `obj['usage']`. Fixed.
+
+**Usage limits:** set `USAGE_5H_LIMIT` and `USAGE_WEEK_LIMIT` in .env for percentage display. Limits are enforced server-side by Anthropic, not stored locally.
+
+### Permission hook fallback fix
+When `permission.sock` is unreachable (relay not running), hook now exits 1 so Claude Code falls through to its TUI instead of auto-denying all tool calls.
+
+### Architecture clarification
+This Claude (the interactive assistant) IS the relay's Claude — the same process receives messages from both Telegram and CLI. `CLAUDE_RELAY_SESSION=1` is correctly set; permission requests from tool use route through Telegram for approval.
