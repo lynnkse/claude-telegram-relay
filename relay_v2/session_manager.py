@@ -52,9 +52,13 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 # How long to wait for Claude's response before giving up (seconds)
-_RESPONSE_TIMEOUT = 180
+# Needs to be long enough for multi-tool runs with several permission prompts
+_RESPONSE_TIMEOUT = 600
 # How often to poll the session JSONL (seconds)
 _POLL_INTERVAL = 0.5
+# If file has stopped growing for this long with no "text" entry, return
+# whatever text we have (catches cases where Claude ends on a tool_use)
+_STALL_FALLBACK = 30.0
 
 
 @dataclass
@@ -375,14 +379,27 @@ class SessionManagerNode:
                     if atype:
                         last_assistant_type = atype
 
-                # Only fire when the last assistant entry was "text" (not tool_use).
+                elapsed = time.time() - last_activity_time
+                # Primary: last entry is "text" and file has been quiet for DEBOUNCE.
                 if (
                     activity_seen
                     and last_text
                     and last_assistant_type == "text"
-                    and (time.time() - last_activity_time) >= _DEBOUNCE
+                    and elapsed >= _DEBOUNCE
                 ):
                     log.info(f"Response complete ({len(last_text)} chars)")
+                    return last_text
+                # Fallback: file stalled for a long time without a final text entry.
+                # Return whatever text we have so Telegram isn't left silent.
+                if (
+                    activity_seen
+                    and last_text
+                    and elapsed >= _STALL_FALLBACK
+                ):
+                    log.warning(
+                        f"Response stalled ({last_assistant_type} was last type) — "
+                        f"returning best text after {elapsed:.0f}s"
+                    )
                     return last_text
         else:
             # Unknown session — scan all files newer than spawn time.
