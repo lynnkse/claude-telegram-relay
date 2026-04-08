@@ -59,12 +59,16 @@ def _deny(message: str = "Denied via Telegram relay.") -> dict:
     }
 
 
+_RELAY_UNREACHABLE = "unreachable"  # sentinel: relay not running, fall through to TUI
+
+
 def _try_once(request: dict) -> str | None:
     """
     Open a fresh connection to permission.sock, send the request, and wait
     up to ATTEMPT_TIMEOUT seconds for a decision.
 
-    Returns "allow" or "deny" on success, None on timeout or connection error.
+    Returns "allow" or "deny" on success, None on timeout, _RELAY_UNREACHABLE
+    if the socket doesn't exist (relay not running — caller should exit 1).
     Each call causes SessionManagerNode to re-broadcast the inline keyboard.
     """
     sock = None
@@ -95,9 +99,12 @@ def _try_once(request: dict) -> str | None:
     except socket.timeout:
         _log("attempt timed out")
         return None
+    except (FileNotFoundError, ConnectionRefusedError) as e:
+        _log(f"relay not reachable: {e}")
+        return _RELAY_UNREACHABLE
     except Exception as e:
         _log(f"ERROR: {e}")
-        return None
+        return _RELAY_UNREACHABLE
     finally:
         if sock:
             try:
@@ -126,6 +133,10 @@ def main():
     for attempt in range(1, MAX_RETRIES + 1):
         _log(f"attempt {attempt}/{MAX_RETRIES}")
         decision = _try_once(request)
+
+        if decision == _RELAY_UNREACHABLE:
+            _log("relay not running — falling through to Claude Code TUI")
+            sys.exit(1)
 
         if decision is not None:
             if decision == "allow":

@@ -33,10 +33,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from datetime import datetime, timezone
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
@@ -446,6 +448,151 @@ def _make_handlers(subscriber: ResponseSubscriber):
     return on_text, on_voice, on_photo, on_document
 
 
+# ── Slash command handlers ────────────────────────────────────────────────────
+
+def _read_session_jsonl(session_id: str) -> list[dict]:
+    project_name = config.PROJECT_DIR.replace("/", "-")
+    session_file = Path.home() / ".claude" / "projects" / project_name / f"{session_id}.jsonl"
+    entries = []
+    if not session_file.exists():
+        return entries
+    with open(session_file, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return entries
+
+
+def _make_slash_handlers():
+
+    async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _is_authorized(update):
+            return
+        text = (
+            "*Available commands*\n\n"
+            "/usage — token usage for current 5h window\n"
+            "/model — current Claude model\n"
+            "/status — relay health check\n"
+            "/clear — start a fresh Claude session (takes effect on next restart)\n"
+            "/help — this message"
+        )
+        await update.message.reply_text(text, parse_mode="Markdown")
+
+    async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _is_authorized(update):
+            return
+        lines = ["*Relay Status*\n"]
+        lock = Path(config.LOCK_FILE)
+        if lock.exists():
+            try:
+                pid = int(lock.read_text().strip())
+                os.kill(pid, 0)
+                lines.append(f"✅ SessionManager running (PID {pid})")
+            except (ProcessLookupError, ValueError):
+                lines.append("❌ SessionManager not running (stale lock)")
+        else:
+            lines.append("❌ SessionManager not running")
+        try:
+            sid = Path(config.SESSION_ID_FILE).read_text().strip()
+            lines.append(f"Session: `{sid[:8]}...`")
+        except Exception:
+            lines.append("Session: none")
+        for name, path in [
+            ("user\\_input.sock", config.USER_INPUT_SOCK),
+            ("permission.sock", config.PERMISSION_SOCK),
+        ]:
+            lines.append(f"{'✅' if Path(path).exists() else '❌'} {name}")
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _is_authorized(update):
+            return
+        try:
+            session_id = Path(config.SESSION_ID_FILE).read_text().strip()
+        except Exception:
+            await update.message.reply_text("No active session.")
+            return
+        entries = _read_session_jsonl(session_id)
+        if not entries:
+            await update.message.reply_text("Session file not found or empty.")
+            return
+
+        cutoff = time.time() - 5 * 3600
+        input_tok = output_tok = cache_read = cache_create = 0
+        earliest_ts: Optional[float] = None
+
+        for obj in entries:
+            # Parse timestamp (ISO string or unix float)
+            ts_raw = obj.get("timestamp")
+            ts: Optional[float] = None
+            if isinstance(ts_raw, str):
+                try:
+                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
+                except Exception:
+                    pass
+            elif isinstance(ts_raw, (int, float)):
+                ts = float(ts_raw)
+            if ts is not None and ts < cutoff:
+                continue
+            if ts is not None and (earliest_ts is None or ts < earliest_ts):
+                earliest_ts = ts
+
+            # Usage can be top-level or inside message
+            usage = obj.get("usage") or obj.get("message", {}).get("usage") or {}
+            input_tok    += usage.get("input_tokens", 0)
+            output_tok   += usage.get("output_tokens", 0)
+            cache_read   += usage.get("cache_read_input_tokens", 0)
+            cache_create += usage.get("cache_creation_input_tokens", 0)
+
+        if earliest_ts:
+            reset_dt = datetime.fromtimestamp(earliest_ts + 5 * 3600, tz=timezone.utc)
+            reset_str = reset_dt.strftime("%H:%M UTC")
+        else:
+            reset_str = "unknown"
+
+        lines = [
+            "*Usage (last 5h)*\n",
+            f"Input:          {input_tok:,}",
+            f"Output:         {output_tok:,}",
+            f"Cache read:     {cache_read:,}",
+            f"Cache creation: {cache_create:,}",
+            f"\nWindow resets: ~{reset_str}",
+        ]
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+    async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _is_authorized(update):
+            return
+        model = "unknown"
+        try:
+            session_id = Path(config.SESSION_ID_FILE).read_text().strip()
+            for obj in _read_session_jsonl(session_id):
+                m = obj.get("model")
+                if m:
+                    model = m
+        except Exception:
+            pass
+        await update.message.reply_text(f"Current model: `{model}`", parse_mode="Markdown")
+
+    async def cmd_clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not _is_authorized(update):
+            return
+        try:
+            Path(config.SESSION_ID_FILE).unlink(missing_ok=True)
+            await update.message.reply_text(
+                "✅ Session cleared. Restart SessionManagerNode to begin a fresh session."
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Error: {e}")
+
+    return cmd_help, cmd_status, cmd_usage, cmd_model, cmd_clear
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main():
@@ -459,6 +606,16 @@ def main():
         loop = asyncio.get_event_loop()
         subscriber = ResponseSubscriber(loop)
         on_text, on_voice, on_photo, on_document = _make_handlers(subscriber)
+        cmd_help, cmd_status, cmd_usage, cmd_model, cmd_clear = _make_slash_handlers()
+
+        # Slash commands (intercepted before reaching Claude PTY)
+        application.add_handler(CommandHandler("help",   cmd_help))
+        application.add_handler(CommandHandler("status", cmd_status))
+        application.add_handler(CommandHandler("usage",  cmd_usage))
+        application.add_handler(CommandHandler("model",  cmd_model))
+        application.add_handler(CommandHandler("clear",  cmd_clear))
+
+        # Message handlers (forwarded to Claude PTY)
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
         application.add_handler(MessageHandler(filters.VOICE, on_voice))
         application.add_handler(MessageHandler(filters.PHOTO, on_photo))
