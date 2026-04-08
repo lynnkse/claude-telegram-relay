@@ -60,3 +60,7 @@ RELAY_DIR: str = get("RELAY_DIR", str(Path.home() / ".claude-relay"))
 SESSION_ID_FILE: str = f"{RELAY_DIR}/session_id"
 LOCK_FILE: str = f"{RELAY_DIR}/session_manager.lock"
 SENTINEL_FILE: str = f"{RELAY_DIR}/sentinel"
+
+# Optional usage limits (set in .env to enable % display in /usage)
+# e.g. USAGE_5H_LIMIT=10000  USAGE_WEEK_LIMIT=100000
+# Leave unset (0) to show raw counts only.

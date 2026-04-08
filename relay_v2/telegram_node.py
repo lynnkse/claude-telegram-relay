@@ -33,7 +33,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     Application,
@@ -512,57 +513,108 @@ def _make_slash_handlers():
     async def cmd_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not _is_authorized(update):
             return
-        try:
-            session_id = Path(config.SESSION_ID_FILE).read_text().strip()
-        except Exception:
-            await update.message.reply_text("No active session.")
-            return
-        entries = _read_session_jsonl(session_id)
-        if not entries:
-            await update.message.reply_text("Session file not found or empty.")
-            return
 
-        cutoff = time.time() - 5 * 3600
-        input_tok = output_tok = cache_read = cache_create = 0
-        earliest_ts: Optional[float] = None
+        tz = ZoneInfo(config.USER_TIMEZONE or "UTC")
+        now = time.time()
+        window_cutoff = now - 5 * 3600
+        week_cutoff   = now - 7 * 24 * 3600
 
-        for obj in entries:
-            # Parse timestamp (ISO string or unix float)
-            ts_raw = obj.get("timestamp")
-            ts: Optional[float] = None
-            if isinstance(ts_raw, str):
+        project_name  = config.PROJECT_DIR.replace("/", "-")
+        sessions_dir  = Path.home() / ".claude" / "projects" / project_name
+
+        def _parse_ts(raw) -> Optional[float]:
+            if isinstance(raw, str):
                 try:
-                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).timestamp()
+                    return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
                 except Exception:
-                    pass
-            elif isinstance(ts_raw, (int, float)):
-                ts = float(ts_raw)
-            if ts is not None and ts < cutoff:
+                    return None
+            if isinstance(raw, (int, float)):
+                return float(raw)
+            return None
+
+        w5h  = dict(inp=0, out=0, cr=0, cc=0)
+        wk   = dict(inp=0, out=0, cr=0, cc=0)
+        earliest_5h: Optional[float] = None
+
+        try:
+            all_files = list(sessions_dir.glob("*.jsonl"))
+        except Exception:
+            all_files = []
+
+        for jfile in all_files:
+            try:
+                with open(jfile, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj  = json.loads(line)
+                            ts   = _parse_ts(obj.get("timestamp"))
+                            usage = obj.get("usage")
+                            if not usage or ts is None:
+                                continue
+                            inp = usage.get("input_tokens", 0)
+                            out = usage.get("output_tokens", 0)
+                            cr  = usage.get("cache_read_input_tokens", 0)
+                            cc  = usage.get("cache_creation_input_tokens", 0)
+                            if ts >= week_cutoff:
+                                wk["inp"] += inp; wk["out"] += out
+                                wk["cr"]  += cr;  wk["cc"]  += cc
+                            if ts >= window_cutoff:
+                                w5h["inp"] += inp; w5h["out"] += out
+                                w5h["cr"]  += cr;  w5h["cc"]  += cc
+                                if earliest_5h is None or ts < earliest_5h:
+                                    earliest_5h = ts
+                        except Exception:
+                            continue
+            except Exception:
                 continue
-            if ts is not None and (earliest_ts is None or ts < earliest_ts):
-                earliest_ts = ts
 
-            # Usage can be top-level or inside message
-            usage = obj.get("usage") or obj.get("message", {}).get("usage") or {}
-            input_tok    += usage.get("input_tokens", 0)
-            output_tok   += usage.get("output_tokens", 0)
-            cache_read   += usage.get("cache_read_input_tokens", 0)
-            cache_create += usage.get("cache_creation_input_tokens", 0)
-
-        if earliest_ts:
-            reset_dt = datetime.fromtimestamp(earliest_ts + 5 * 3600, tz=timezone.utc)
-            reset_str = reset_dt.strftime("%H:%M UTC")
+        # 5h window reset countdown
+        if earliest_5h:
+            reset_ts  = earliest_5h + 5 * 3600
+            reset_dt  = datetime.fromtimestamp(reset_ts, tz=tz)
+            mins_left = int((reset_ts - now) / 60)
+            if mins_left > 0:
+                h, m = divmod(mins_left, 60)
+                countdown = f"in {h}h {m}m" if h else f"in {m}m"
+            else:
+                countdown = "soon"
+            win_reset = f"{reset_dt.strftime('%H:%M %Z')} ({countdown})"
         else:
-            reset_str = "unknown"
+            win_reset = "no activity in window"
+
+        # Weekly reset — next Monday 00:00 local
+        now_dt     = datetime.fromtimestamp(now, tz=tz)
+        days_to_mon = (7 - now_dt.weekday()) % 7 or 7
+        wk_reset_dt = (now_dt + timedelta(days=days_to_mon)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        wk_reset = wk_reset_dt.strftime("%a %d/%m %H:%M %Z")
+
+        # Percentage helpers (limits from .env, 0 = not set)
+        lim_5h = int(config.get("USAGE_5H_LIMIT", "0") or 0)
+        lim_wk = int(config.get("USAGE_WEEK_LIMIT", "0") or 0)
+
+        def pct(used: int, limit: int) -> str:
+            return f" — {used * 100 // limit}%" if limit else ""
 
         lines = [
-            "*Usage (last 5h)*\n",
-            f"Input:          {input_tok:,}",
-            f"Output:         {output_tok:,}",
-            f"Cache read:     {cache_read:,}",
-            f"Cache creation: {cache_create:,}",
-            f"\nWindow resets: ~{reset_str}",
+            f"*5h window* — resets {win_reset}",
+            f"Output: {w5h['out']:>9,}{pct(w5h['out'], lim_5h)}",
+            f"Input:  {w5h['inp']:>9,}",
+            f"Cache:  {w5h['cr']:>9,} read / {w5h['cc']:,} created",
+            "",
+            f"*7-day total* — resets {wk_reset}",
+            f"Output: {wk['out']:>9,}{pct(wk['out'], lim_wk)}",
+            f"Input:  {wk['inp']:>9,}",
+            f"Cache:  {wk['cr']:>9,} read / {wk['cc']:,} created",
         ]
+        if not lim_5h or not lim_wk:
+            lines.append(
+                "\n_Set USAGE\\_5H\\_LIMIT and USAGE\\_WEEK\\_LIMIT in .env for % display_"
+            )
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
     async def cmd_model(update: Update, context: ContextTypes.DEFAULT_TYPE):
