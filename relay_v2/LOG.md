@@ -47,3 +47,17 @@ When `permission.sock` is unreachable (relay not running), hook now exits 1 so C
 
 ### Architecture clarification
 This Claude (the interactive assistant) IS the relay's Claude — the same process receives messages from both Telegram and CLI. `CLAUDE_RELAY_SESSION=1` is correctly set; permission requests from tool use route through Telegram for approval.
+
+## 2026-04-08 — Auto-allow safe permissions
+
+Added `_auto_decision()` to `permission_hook.py`. Runs before connecting to `permission.sock`, so safe actions never reach Telegram.
+
+**Auto-allowed:** Read/Glob/Grep, WebFetch/WebSearch, Edit/Write within `~` (except sensitive paths like ~/.ssh, ~/.aws), Bash commands without dangerous patterns.
+
+**Always asks:** `sudo`, `rm -rf`, `git reset --hard`, `git push --force`, `dd`, `mkfs`, writes outside home dir or to sensitive paths, unknown tools.
+
+**Kill switch:** `CLAUDE_AUTO_ALLOW=0` in environment disables all auto-allow.
+
+**Bug fixed:** heredoc content containing dangerous-looking strings (e.g. "git reset --hard" in a log entry) was incorrectly triggering the ask-user path. Now only the first line (the actual shell command) is pattern-matched.
+
+Logged to `/tmp/permission_hook.log` with `AUTO-ALLOW:` prefix for audit trail.

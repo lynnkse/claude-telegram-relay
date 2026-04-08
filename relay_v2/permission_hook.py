@@ -93,7 +93,10 @@ def _auto_decision(tool_name: str, tool_input: dict) -> str | None:
     # ── Bash: block known-dangerous patterns, allow everything else ────────
     if tool_name == "Bash":
         command = tool_input.get("command", "")
-        if _DANGEROUS_BASH.search(command):
+        # Only scan the first line — heredoc bodies can contain dangerous-
+        # looking strings that are just content, not commands being run.
+        first_line = command.split("\n")[0]
+        if _DANGEROUS_BASH.search(first_line):
             return None  # ask user — don't auto-deny, let them decide
         return "allow"
 
