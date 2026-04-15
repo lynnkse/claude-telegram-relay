@@ -513,10 +513,11 @@ class SessionManagerNode:
             # trailing \r, leaving the message sitting unsubmitted in the TUI.
             try:
                 encoded = item.text.encode()
-                chunk_size = 512
+                chunk_size = 256
                 for i in range(0, len(encoded), chunk_size):
                     os.write(self.master_fd, encoded[i:i + chunk_size])
-                    time.sleep(0.02)
+                    time.sleep(0.05)
+                time.sleep(0.1)
                 os.write(self.master_fd, b"\r")
             except OSError:
                 log.error("Failed to write message to PTY")
