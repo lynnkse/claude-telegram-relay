@@ -2,11 +2,11 @@
 
 ## Pending
 
-- [ ] **GLM-Z1-32B sub-agent via MCP** — Build `glm_agent` MCP server that wraps GLM in an agentic tool loop. Claude calls `delegate_to_glm(task, context_files)`, GLM runs until done, Claude reviews and applies. Two backend options: (A) ZhipuAI API key — cheapest path, Lynn provides key; (B) local Ollama — free, needs ~20GB VRAM, one `ollama pull` command. I write all code, Lynn provides key or runs one command. Register via `claude mcp add glm-agent` automatically. **Use case: ROS/SLAM repo multi-file refactors — Claude orchestrates, GLM does heavy lifting, Claude reviews before applying.**
+- [x] **GLM sub-agent via MCP** — `relay_v2/glm_agent.py` built and registered. Model: glm-5.1 (flagship). Key wired in. Tested and working. Claude calls `delegate_to_glm(task, context)` to delegate code tasks. glm-z1 (reasoning) requires paid tier — upgrade when needed.
 
 - [ ] **Automated experiment startup: lab machine + robot over SSH** — Claude autonomously launches the full 5-terminal experiment setup. Prerequisites: (1) SSH key auth from lab machine to robot (`ssh-copy-id`), (2) passwordless sudo on robot scoped to sensor script (`visudo`). Then Claude runs: roscore + roslaunch on lab machine via tmux, and roslaunch + controller + sensors on robot via SSH into tmux sessions. Triggered by "start the experiment" from Telegram. Claude verifies each step launched correctly before proceeding.
 
-- [ ] **Deploy relay on work PC for ROS/SLAM repo** — Clone relay to `~/claude-relay/` on work PC (outside catkin). Set `PROJECT_DIR=/path/to/ros/repo`, `CHANNEL=work`, same Supabase credentials. Relay spawns Claude with `cwd=PROJECT_DIR` so existing `.claude/BOOTSTRAP.md` structure is picked up automatically. No changes to ROS repo needed. Same Supabase DB — `channel` column separates personal vs work.
+- [x] **Deploy relay on work PC for ROS/SLAM repo** — Relay running on work PC. Supabase MCP connected (settings.json updated with auth header). Work bot operational.
 
 - [ ] **`knowledge` table: professional insights across projects** — Separate table from `memory` (which stays personal). Stores lessons learned, procedures, patterns, warnings per project. Has `project` column (null = cross-project). Needs schema migration + `embed` webhook + injection into system prompt filtered by current project. Design doc needed before implementation.
 
@@ -20,7 +20,7 @@
 
 - [ ] **Dreaming mode / memory consolidation** — Background process that consolidates raw Supabase memory into high-signal durable knowledge. Runs when agent is idle. Three phases: light (extract candidates), REM (detect patterns, strengthen), deep (score + promote to durable memory). See `DREAMING_MODE.md` for full spec. **Prerequisite: plain Supabase memory must be working and validated first.**
 
-- [ ] **GLM-Z1-32B sub-agent via MCP** — Build `glm_agent` MCP server that wraps GLM in an agentic tool loop. Claude calls `delegate_to_glm(task, context_files)`, GLM runs until done, Claude reviews and applies. Two backend options: (A) ZhipuAI API key — cheapest path, Lynn provides key; (B) local Ollama — free, needs ~20GB VRAM, one `ollama pull` command. I write all code, Lynn provides key or runs one command. Register via `claude mcp add glm-agent` automatically.
+- [ ] **[FUTURE PROJECT] Local AI Agent on USB SSD + RTX 3090** — Full spec in `LOCAL_AI_AGENT_SPEC.md`. Model: **Dolphin3.0-Mistral-24B** (Q4, ~14GB VRAM). USB holds all state (chats, memory, vectordb, characters). Compute on RTX 3090 via Ollama. SillyTavern frontend. Optional Telegram bridge. 8-phase deployment via bootstrap script. No cloud dependencies after setup. **Status: spec written, nothing built. Not urgent.**
 
 ## Done
 

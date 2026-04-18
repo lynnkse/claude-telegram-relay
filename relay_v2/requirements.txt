@@ -1,2 +1,4 @@
 python-telegram-bot==22.7
 groq==1.1.2
+mcp
+zhipuai
