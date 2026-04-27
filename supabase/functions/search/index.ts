@@ -61,12 +61,18 @@ Deno.serve(async (req) => {
       Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
     );
 
-    const rpcName = table === "memory" ? "match_memory" : "match_messages";
+    const rpcName =
+      table === "memory"       ? "match_memory"       :
+      table === "autocad_docs" ? "match_autocad_docs" :
+      table === "documents"    ? "match_documents"    :
+      "match_messages";
+
+    const noThresholdTables = ["autocad_docs", "documents"];
 
     const { data: results, error } = await supabase.rpc(rpcName, {
       query_embedding: embedding,
-      match_threshold,
       match_count,
+      ...(!noThresholdTables.includes(table) && { match_threshold }),
     });
 
     if (error) {

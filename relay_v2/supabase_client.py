@@ -73,6 +73,35 @@ def _rest_insert(table: str, payload: dict) -> bool:
         return False
 
 
+def _rest_patch(table: str, filters: str, payload: dict) -> bool:
+    """PATCH (update) rows matching filters. Never deletes anything."""
+    if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+        return False
+    url = f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/{table}?{filters}"
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="PATCH",
+        headers={
+            "apikey": config.SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status in (200, 201, 204)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        log.warning(f"Supabase patch {table} failed {e.code}: {body[:200]}")
+        return False
+    except Exception as e:
+        log.warning(f"Supabase patch {table} error: {e}")
+        return False
+
+
 def _fire(fn, *args):
     """Run fn(*args) in a daemon thread — non-blocking."""
     threading.Thread(target=fn, args=args, daemon=True).start()
@@ -81,6 +110,54 @@ def _fire(fn, *args):
 # ------------------------------------------------------------------
 # Public API
 # ------------------------------------------------------------------
+
+def _mark_done(search_text: str):
+    """
+    Mark a memory row as completed by setting completed_at.
+    Searches for rows whose content contains search_text (case-insensitive).
+    Never deletes — only updates. If no match, inserts a completed record.
+    """
+    import urllib.parse, datetime
+    if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+        return
+
+    now = datetime.datetime.utcnow().isoformat() + "Z"
+
+    # Try to find and update existing row
+    search_encoded = urllib.parse.quote(search_text[:60])
+    find_url = (
+        f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/memory"
+        f"?content=ilike.*{search_encoded}*&completed_at=is.null&limit=1&select=id"
+    )
+    req = urllib.request.Request(
+        find_url,
+        headers={
+            "apikey": config.SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            rows = json.loads(r.read().decode())
+    except Exception as e:
+        log.warning(f"Mark done lookup failed: {e}")
+        rows = []
+
+    if rows:
+        row_id = rows[0]["id"]
+        _rest_patch("memory", f"id=eq.{row_id}", {"completed_at": now})
+        log.info(f"Marked done (id={row_id}): {search_text[:60]}")
+    else:
+        # No matching open task — insert a completed record so it's still tracked
+        _rest_insert("memory", {
+            "type": "completed_goal",
+            "content": f"Completed: {search_text.strip()}",
+            "completed_at": now,
+            "priority": 0,
+            "metadata": {},
+        })
+        log.info(f"No open task found for '{search_text[:40]}', inserted completed record")
+
 
 def save_message(role: str, content: str, channel: str = "telegram", metadata: Optional[dict] = None):
     """Save a message to the messages table (non-blocking)."""
@@ -208,6 +285,53 @@ def fetch_memory_context(limit: int = 50) -> str:
     return "Long-term memory from past sessions:\n" + "\n\n".join(results)
 
 
+def fetch_recent_messages(n: int = 20, channel: Optional[str] = None) -> str:
+    """
+    Fetch the last N messages from the messages table for session resume context.
+    Returns a formatted transcript string, oldest first.
+    Returns empty string if unavailable.
+    """
+    if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+        return ""
+
+    filter_part = f"&channel=eq.{channel}" if channel else ""
+    url = (
+        f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/messages"
+        f"?select=role,content,created_at{filter_part}"
+        f"&order=created_at.desc&limit={n}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "apikey": config.SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read().decode())
+    except Exception as e:
+        log.warning(f"Failed to fetch recent messages: {e}")
+        return ""
+
+    if not rows:
+        return ""
+
+    rows.reverse()  # oldest first
+    lines = []
+    for r in rows:
+        role = r.get("role", "?")
+        speaker = "User" if role == "user" else "Assistant"
+        content = r.get("content", "").strip()
+        if content:
+            lines.append(f"{speaker}: {content[:300]}")
+
+    if not lines:
+        return ""
+
+    return "Recent conversation (last session, for context):\n" + "\n".join(lines)
+
+
 def process_response(text: str, channel: str = "telegram") -> str:
     """
     Parse memory tags from Claude's response text, save them to Supabase,
@@ -233,8 +357,8 @@ def process_response(text: str, channel: str = "telegram") -> str:
     for done_text in dones:
         done_text = done_text.strip()
         if done_text:
-            log.info(f"Memory: goal completed: {done_text[:60]}")
-            save_memory("completed_goal", f"Completed: {done_text}")
+            log.info(f"Memory: marking done: {done_text[:60]}")
+            _fire(_mark_done, done_text)
 
     insights = _INSIGHT_RE.findall(text)
     for content, project, type_, confidence in insights:

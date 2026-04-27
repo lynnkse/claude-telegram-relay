@@ -132,20 +132,24 @@ class SessionManagerNode:
             parts.append(f"User timezone: {config.USER_TIMEZONE}")
         if profile:
             parts.append(f"\nProfile:\n{profile}")
-        memory_context = supabase_client.fetch_memory_context()
-        if memory_context:
-            parts.append(f"\n{memory_context}")
-        parts.append(
-            "\nMEMORY MANAGEMENT: When the user shares something worth remembering, "
-            "include these tags in your response (processed automatically, hidden from user):\n"
-            "[REMEMBER: fact to store]\n"
-            "[GOAL: goal text | DEADLINE: optional date]\n"
-            "[DONE: search text for completed goal]\n"
-            "[INSIGHT: content | PROJECT: project_name | TYPE: architecture|failure_mode|performance|stability|design|procedure|warning|pattern | CONFIDENCE: 1-5]\n"
-            "Use INSIGHT for professional/technical observations: system architecture patterns, failure modes, "
-            "performance characteristics, mathematical stability edge cases, design tradeoffs. "
-            "PROJECT is optional (omit for cross-project insights). CONFIDENCE: 1=hypothesis, 3=observed, 5=battle-tested."
-        )
+        if not config.SKIP_MEMORY_FETCH:
+            memory_context = supabase_client.fetch_memory_context()
+            if memory_context:
+                parts.append(f"\n{memory_context}")
+            recent_msgs = supabase_client.fetch_recent_messages(n=20)
+            if recent_msgs:
+                parts.append(f"\n{recent_msgs}")
+            parts.append(
+                "\nMEMORY MANAGEMENT: When the user shares something worth remembering, "
+                "include these tags in your response (processed automatically, hidden from user):\n"
+                "[REMEMBER: fact to store]\n"
+                "[GOAL: goal text | DEADLINE: optional date]\n"
+                "[DONE: search text for completed goal]\n"
+                "[INSIGHT: content | PROJECT: project_name | TYPE: architecture|failure_mode|performance|stability|design|procedure|warning|pattern | CONFIDENCE: 1-5]\n"
+                "Use INSIGHT for professional/technical observations: system architecture patterns, failure modes, "
+                "performance characteristics, mathematical stability edge cases, design tradeoffs. "
+                "PROJECT is optional (omit for cross-project insights). CONFIDENCE: 1=hypothesis, 3=observed, 5=battle-tested."
+            )
         return "\n".join(parts)
 
     # ------------------------------------------------------------------
@@ -570,7 +574,7 @@ class SessionManagerNode:
             supabase_client.save_message(
                 role="user",
                 content=item.text,
-                channel=item.source,
+                channel=config.SESSION_CHANNEL,
             )
 
             # If we know the session file, record its current size so we only
@@ -636,11 +640,11 @@ class SessionManagerNode:
 
     def _publish_response(self, item: QueueItem, response_text: str):
         # Parse memory tags, save to Supabase, strip tags from delivered text
-        clean_text = supabase_client.process_response(response_text, channel=item.source)
+        clean_text = supabase_client.process_response(response_text, channel=config.SESSION_CHANNEL)
         supabase_client.save_message(
             role="assistant",
             content=clean_text,
-            channel=item.source,
+            channel=config.SESSION_CHANNEL,
         )
         payload = json.dumps({
             "text": clean_text,

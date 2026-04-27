@@ -156,6 +156,7 @@ class ResponseSubscriber:
         self._response_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._permission_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._tui_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._proactive_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._thread = threading.Thread(target=self._reader_thread, daemon=True)
         self._thread.start()
 
@@ -189,6 +190,10 @@ class ResponseSubscriber:
                                 self._loop.call_soon_threadsafe(
                                     self._tui_queue.put_nowait, msg
                                 )
+                            elif msg.get("source") == "proactive":
+                                self._loop.call_soon_threadsafe(
+                                    self._proactive_queue.put_nowait, msg
+                                )
                             else:
                                 self._loop.call_soon_threadsafe(
                                     self._response_queue.put_nowait, msg
@@ -213,6 +218,9 @@ class ResponseSubscriber:
     async def get_tui_prompt(self) -> dict:
         return await self._tui_queue.get()
 
+    async def get_proactive(self) -> dict:
+        return await self._proactive_queue.get()
+
 
 # ── Permission debug log ──────────────────────────────────────────────────────
 
@@ -231,7 +239,24 @@ def _plog(msg: str):
 
 # ── Core handler logic ────────────────────────────────────────────────────────
 
+# Serialize text message processing: only one message processed at a time.
+# This prevents race conditions where two concurrent _wait_for_response calls
+# grab each other's responses from the shared response queue.
+# Button callbacks (permissions, TUI) bypass this lock and always pass through.
+_message_lock: Optional[asyncio.Lock] = None  # initialized inside the event loop
+
+
+def _get_message_lock() -> asyncio.Lock:
+    global _message_lock
+    if _message_lock is None:
+        _message_lock = asyncio.Lock()
+    return _message_lock
+
+
 AUTHORIZED_USER_ID = config.get("TELEGRAM_USER_ID")
+_extra_ids: set[str] = {
+    uid.strip() for uid in config.EXTRA_USER_IDS.split(",") if uid.strip()
+}
 UPLOADS_DIR = Path(config.RELAY_DIR) / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -239,7 +264,8 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 def _is_authorized(update: Update) -> bool:
     if not AUTHORIZED_USER_ID:
         return True
-    return str(update.effective_user.id) == AUTHORIZED_USER_ID
+    uid = str(update.effective_user.id)
+    return uid == AUTHORIZED_USER_ID or uid in _extra_ids
 
 
 async def _typing_keepalive(update: Update, context: ContextTypes.DEFAULT_TYPE, stop_event: asyncio.Event):
@@ -274,23 +300,24 @@ async def _handle_and_reply(
     """Common handler: send to SessionManager, keepalive, deliver response."""
     user_id = str(update.effective_user.id)
 
-    # Typing indicator while waiting
-    stop_typing = asyncio.Event()
-    typing_task = asyncio.create_task(
-        _typing_keepalive(update, context, stop_typing)
-    )
+    async with _get_message_lock():
+        # Typing indicator while waiting
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(
+            _typing_keepalive(update, context, stop_typing)
+        )
 
-    _send_to_session_manager(text, source, user_id, media_path)
+        _send_to_session_manager(text, source, user_id, media_path)
 
-    try:
-        raw = await _wait_for_response(subscriber, source)
-    finally:
-        stop_typing.set()
-        typing_task.cancel()
         try:
-            await typing_task
-        except asyncio.CancelledError:
-            pass
+            raw = await _wait_for_response(subscriber, source)
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+            try:
+                await typing_task
+            except asyncio.CancelledError:
+                pass
 
     clean = _strip_memory_tags(raw)
     if not clean:
@@ -374,6 +401,35 @@ async def _tui_dispatcher(
             )
         except Exception as e:
             log.error(f"Failed to send TUI prompt to Telegram: {e}")
+
+
+_SILENT_TOKEN = "[SILENT]"
+
+
+async def _proactive_dispatcher(
+    subscriber: ResponseSubscriber,
+    bot,
+    authorized_user_id: str,
+):
+    """
+    Background task: receives proactive responses from SessionManager.
+    Discards [SILENT] responses; forwards everything else to the user.
+    """
+    while True:
+        msg = await subscriber.get_proactive()
+        raw = msg.get("text", "")
+        clean = _strip_memory_tags(raw).strip()
+
+        if not clean or _SILENT_TOKEN.lower() in clean.lower():
+            log.info("Proactive check-in: silent (nothing to send)")
+            continue
+
+        log.info(f"Proactive message to Telegram: {clean[:80]}")
+        for chunk in _split_message(clean):
+            try:
+                await bot.send_message(chat_id=authorized_user_id, text=chunk)
+            except Exception as e:
+                log.error(f"Failed to send proactive message: {e}")
 
 
 async def _permission_dispatcher(
@@ -767,13 +823,16 @@ def main():
 
         application.add_handler(CallbackQueryHandler(on_tui_callback, pattern="^tui:"))
 
-        # Start permission + TUI dispatchers as background asyncio tasks
+        # Start permission, TUI, and proactive dispatchers as background asyncio tasks
         if AUTHORIZED_USER_ID:
             loop.create_task(
                 _permission_dispatcher(subscriber, application.bot, AUTHORIZED_USER_ID)
             )
             loop.create_task(
                 _tui_dispatcher(subscriber, application.bot, AUTHORIZED_USER_ID)
+            )
+            loop.create_task(
+                _proactive_dispatcher(subscriber, application.bot, AUTHORIZED_USER_ID)
             )
 
         log.info(f"TelegramNode starting (authorized user: {AUTHORIZED_USER_ID or 'ANY'})")

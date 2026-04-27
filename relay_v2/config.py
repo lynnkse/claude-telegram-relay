@@ -9,8 +9,9 @@ from pathlib import Path
 # Locate .env relative to this file: relay_v2/../.env
 _ENV_PATH = Path(__file__).parent.parent / ".env"
 
-# Locate profile.md: relay_v2/../config/profile.md
-PROFILE_PATH = Path(__file__).parent.parent / "config" / "profile.md"
+# Locate profile.md: relay_v2/../config/profile.md (overridable via PROFILE_PATH env)
+_default_profile = str(Path(__file__).parent.parent / "config" / "profile.md")
+PROFILE_PATH: Path = Path(os.environ.get("PROFILE_PATH") or _default_profile)
 
 
 def _load_env(path: Path) -> dict:
@@ -47,8 +48,8 @@ USER_ID: str = get("TELEGRAM_USER_ID", "lynn")
 SUPABASE_URL: str = get("SUPABASE_URL", "")
 SUPABASE_ANON_KEY: str = get("SUPABASE_ANON_KEY", "")
 
-# Socket paths
-SOCKET_DIR: str = "/tmp/cognitive-hq"
+# Socket paths (SOCKET_DIR overridable for multiple session instances)
+SOCKET_DIR: str = get("SOCKET_DIR", "/tmp/cognitive-hq")
 USER_INPUT_SOCK: str = f"{SOCKET_DIR}/user_input.sock"
 CLAUDE_RESPONSE_SOCK: str = f"{SOCKET_DIR}/claude_response.sock"
 DISPLAY_SOCK: str = f"{SOCKET_DIR}/display.sock"
@@ -64,3 +65,16 @@ SENTINEL_FILE: str = f"{RELAY_DIR}/sentinel"
 # Optional usage limits (set in .env to enable % display in /usage)
 # e.g. USAGE_5H_LIMIT=10000  USAGE_WEEK_LIMIT=100000
 # Leave unset (0) to show raw counts only.
+
+# Set SKIP_MEMORY_FETCH=1 to disable personal memory injection (e.g. for isolated sessions)
+SKIP_MEMORY_FETCH: bool = get("SKIP_MEMORY_FETCH", "").lower() in ("1", "true", "yes")
+
+# Channel name used when saving messages to Supabase. Override per-session to avoid cross-contamination.
+SESSION_CHANNEL: str = get("SESSION_CHANNEL", "telegram")
+
+# Comma-separated extra Telegram user IDs allowed to send messages (beyond TELEGRAM_USER_ID)
+EXTRA_USER_IDS: str = get("TELEGRAM_EXTRA_USER_IDS", "")
+
+# Proactive check-in interval in seconds (default: 10 min)
+PROACTIVE_INTERVAL: int = int(get("PROACTIVE_INTERVAL", "600") or "600")
+PROACTIVE_ENABLED: bool = get("PROACTIVE_ENABLED", "1").lower() not in ("0", "false", "no")
