@@ -112,10 +112,28 @@ async def _transcribe_groq(audio_bytes: bytes) -> str:
         log.warning("GROQ_API_KEY not set")
         return ""
     try:
+        import tempfile, asyncio, os
+        # Convert OGA/OGG/Opus to mp3 via ffmpeg for reliable Groq compatibility
+        with tempfile.NamedTemporaryFile(suffix=".oga", delete=False) as src_f:
+            src_f.write(audio_bytes)
+            src_path = src_f.name
+        mp3_path = src_path.replace(".oga", ".mp3")
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-y", "-i", src_path, "-ar", "16000", "-ac", "1", "-b:a", "64k", mp3_path,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0 or not os.path.exists(mp3_path):
+            log.error(f"ffmpeg failed (rc={proc.returncode}): {stderr.decode()[-300:]}")
+            os.unlink(src_path)
+            return ""
+        with open(mp3_path, "rb") as mp3_f:
+            mp3_bytes = mp3_f.read()
+        os.unlink(src_path); os.unlink(mp3_path)
         from groq import AsyncGroq
         client = AsyncGroq(api_key=groq_key)
         result = await client.audio.transcriptions.create(
-            file=("voice.ogg", audio_bytes),
+            file=("voice.mp3", mp3_bytes, "audio/mpeg"),
             model="whisper-large-v3-turbo",
         )
         return result.text.strip()
@@ -495,7 +513,11 @@ def _make_handlers(subscriber: ResponseSubscriber):
         await update.message.reply_chat_action("typing")
         try:
             tg_file = await voice.get_file()
-            audio_bytes = await tg_file.download_as_bytearray()
+            import httpx
+            async with httpx.AsyncClient(timeout=30) as dl_client:
+                resp = await dl_client.get(tg_file.file_path)
+                audio_bytes = resp.content
+            log.info(f"Voice download: {len(audio_bytes)} bytes, status={resp.status_code}")
             transcription = await _transcribe_voice(bytes(audio_bytes))
             if not transcription:
                 await update.message.reply_text("Could not transcribe voice message.")
