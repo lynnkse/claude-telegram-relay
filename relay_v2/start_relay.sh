@@ -20,6 +20,21 @@ fi
 
 cd "$SCRIPT_DIR"
 
+# PID lock — prevent multiple relay instances
+RELAY_LOCK="/tmp/cognitive-hq-relay.lock"
+if [ -f "$RELAY_LOCK" ]; then
+    OLD_PID=$(cat "$RELAY_LOCK")
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "[relay] ERROR: relay already running (PID $OLD_PID). Kill it first: kill $OLD_PID"
+        exit 1
+    else
+        echo "[relay] Stale lock found, removing."
+        rm -f "$RELAY_LOCK"
+    fi
+fi
+echo $$ > "$RELAY_LOCK"
+trap "rm -f $RELAY_LOCK" EXIT
+
 echo "[relay] Starting main relay session..."
 
 python3 session_manager.py &
