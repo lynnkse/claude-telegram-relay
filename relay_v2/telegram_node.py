@@ -485,6 +485,80 @@ async def _permission_dispatcher(
             _send_permission_response("deny")
 
 
+# ── PDF study ingestion ───────────────────────────────────────────────────────
+
+_INGEST_SCRIPT = Path(__file__).parent / "study_ingest.py"
+
+async def _ingest_study_pdf(update: Update, file_path: str, caption: str):
+    """
+    Run study_ingest.py on a PDF sent via Telegram.
+    Caption format: "Area Name | Book Title | Author"  (area required, rest optional)
+    Example: "Linear Algebra | Introduction to Linear Algebra | Gilbert Strang"
+    """
+    parts = [p.strip() for p in caption.split("|")]
+    area = parts[0] if parts and parts[0] else ""
+    title = parts[1] if len(parts) > 1 else Path(file_path).stem
+    author = parts[2] if len(parts) > 2 else ""
+
+    if not area:
+        await update.message.reply_text(
+            "Send the PDF with a caption specifying the study area:\n"
+            "`Linear Algebra | Book Title | Author`\n\n"
+            "Available areas: Linear Algebra, Calculus, Factor Graphs, "
+            "Markov Processes, Estimation Theory",
+            parse_mode="Markdown",
+        )
+        return
+
+    await update.message.reply_text(
+        f"Ingesting *{title}* ({area})...\nThis will take a few minutes.",
+        parse_mode="Markdown",
+    )
+
+    env = os.environ.copy()
+    env["SUPABASE_URL"] = config.SUPABASE_URL
+    env["SUPABASE_ANON_KEY"] = config.SUPABASE_ANON_KEY
+    env["TELEGRAM_BOT_TOKEN"] = config.get("TELEGRAM_BOT_TOKEN")
+    env["TELEGRAM_USER_ID"] = config.get("TELEGRAM_USER_ID")
+
+    cmd = [
+        sys.executable, str(_INGEST_SCRIPT),
+        file_path,
+        "--area", area,
+        "--title", title,
+    ]
+    if author:
+        cmd += ["--author", author]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+        )
+        stdout, _ = await proc.communicate()
+        output = stdout.decode(errors="replace")
+        log.info(f"study_ingest output:\n{output[-1000:]}")
+        if proc.returncode == 0:
+            # Extract summary lines from output
+            lines = [l for l in output.splitlines() if any(
+                kw in l for kw in ["complete", "Chunks", "Chapters", "Pages", "Error"]
+            )]
+            summary = "\n".join(lines[-6:]) if lines else "Done."
+            await update.message.reply_text(f"✅ Ingestion complete\n{summary}")
+        else:
+            await update.message.reply_text(f"❌ Ingestion failed:\n{output[-500:]}")
+    except Exception as e:
+        log.error(f"PDF ingestion error: {e}")
+        await update.message.reply_text(f"❌ Error running ingestion: {e}")
+    finally:
+        try:
+            os.unlink(file_path)
+        except Exception:
+            pass
+
+
 # ── Message handlers ──────────────────────────────────────────────────────────
 
 def _make_handlers(subscriber: ResponseSubscriber):
@@ -561,6 +635,13 @@ def _make_handlers(subscriber: ResponseSubscriber):
             file_name = doc.file_name or f"file_{ts}"
             file_path = str(UPLOADS_DIR / f"{ts}_{file_name}")
             await tg_file.download_to_drive(file_path)
+
+            # PDF study book ingestion
+            if (doc.file_name or "").lower().endswith(".pdf"):
+                caption = update.message.caption or ""
+                await _ingest_study_pdf(update, file_path, caption)
+                return
+
             caption = update.message.caption or f"Analyze: {doc.file_name}"
             text = f"[File: {file_path}]\n\n{caption}"
             await _handle_and_reply(update, context, subscriber, text, media_path=file_path)
