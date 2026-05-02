@@ -941,7 +941,7 @@ def main():
         log.info(f"TelegramNode starting (authorized user: {AUTHORIZED_USER_ID or 'ANY'})")
 
     app = Application.builder().token(token).concurrent_updates(True).post_init(post_init).build()
-    app.run_polling()
+    app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":

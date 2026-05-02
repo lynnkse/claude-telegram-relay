@@ -16,17 +16,31 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY", "")
+def _load_env() -> dict:
+    env_path = Path(__file__).parent.parent / ".env"
+    result = {}
+    try:
+        for line in env_path.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, _, v = line.partition("=")
+            result[k.strip()] = v.strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return result
+
+_env = _load_env()
+
+def _get(key: str) -> str:
+    return os.environ.get(key) or _env.get(key, "")
+
+SUPABASE_URL = _get("SUPABASE_URL")
+SUPABASE_KEY = _get("SUPABASE_ANON_KEY")
 
 
 def search_study_content(query: str, area: str = "", limit: int = 6) -> list[dict]:
-    params = urllib.parse.urlencode({
-        "query": query,
-        "match_count": limit,
-        **({"filter": json.dumps({"area": area})} if area else {}),
-    })
-    data = json.dumps({"query": query, "match_count": limit}).encode()
+    data = json.dumps({"query": query, "match_count": limit, "table": "study_book_chunks"}).encode()
     req = urllib.request.Request(
         f"{SUPABASE_URL}/functions/v1/search",
         data=data,
@@ -37,19 +51,29 @@ def search_study_content(query: str, area: str = "", limit: int = 6) -> list[dic
     )
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
-            return json.loads(r.read().decode())
+            results = json.loads(r.read().decode())
+        return results if isinstance(results, list) else [results]
     except Exception as e:
-        return [{"error": str(e)}]
+        # Fallback: full-text search via REST
+        try:
+            encoded = urllib.parse.quote(query[:100])
+            url = f"{SUPABASE_URL}/rest/v1/study_book_chunks?content=ilike.*{encoded}*&limit={limit}&select=content,chapter,page_num"
+            req2 = urllib.request.Request(url, headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+            })
+            with urllib.request.urlopen(req2, timeout=15) as r:
+                return json.loads(r.read().decode())
+        except Exception as e2:
+            return [{"error": str(e2)}]
 
 
 def get_study_progress() -> dict:
-    req = urllib.request.Request(
-        f"{SUPABASE_URL}/rest/v1/study_topics?select=name,status,progress,last_tested_at,study_areas(name)&order=progress.asc",
-        headers={
-            "apikey": SUPABASE_KEY,
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-        },
-    )
+    url = f"{SUPABASE_URL}/rest/v1/study_topics?select=name,status,progress,last_tested_at&order=progress.asc"
+    req = urllib.request.Request(url, headers={
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    })
     try:
         with urllib.request.urlopen(req, timeout=15) as r:
             return {"topics": json.loads(r.read().decode())}
@@ -92,7 +116,7 @@ def update_topic_progress(topic_name: str, progress: int, status: str = "") -> d
 
 def list_books() -> dict:
     req = urllib.request.Request(
-        f"{SUPABASE_URL}/rest/v1/study_books?select=id,title,author,total_pages,created_at,study_areas(name)",
+        f"{SUPABASE_URL}/rest/v1/study_books?select=id,title,author,total_pages,created_at",
         headers={
             "apikey": SUPABASE_KEY,
             "Authorization": f"Bearer {SUPABASE_KEY}",
