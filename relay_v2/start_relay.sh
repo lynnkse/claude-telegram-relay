@@ -20,6 +20,9 @@ fi
 
 cd "$SCRIPT_DIR"
 
+# Use pyenv python if available (needed on machines with system python < 3.9)
+PYTHON="$(pyenv which python 2>/dev/null || which python3)"
+
 # PID lock — prevent multiple relay instances
 RELAY_LOCK="/tmp/cognitive-hq-relay.lock"
 if [ -f "$RELAY_LOCK" ]; then
@@ -37,7 +40,7 @@ trap "rm -f $RELAY_LOCK" EXIT
 
 echo "[relay] Starting main relay session..."
 
-python3 session_manager.py &
+$PYTHON session_manager.py &
 SM_PID=$!
 echo "[relay] SessionManager PID: $SM_PID"
 
@@ -47,11 +50,11 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-python3 telegram_node.py &
+$PYTHON telegram_node.py &
 TG_PID=$!
 echo "[relay] TelegramNode PID: $TG_PID"
 
-python3 proactive_node.py &
+$PYTHON proactive_node.py &
 PRO_PID=$!
 echo "[relay] ProactiveNode PID: $PRO_PID"
 
