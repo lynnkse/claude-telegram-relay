@@ -502,10 +502,9 @@ async def _ingest_study_pdf(update: Update, file_path: str, caption: str):
 
     if not area:
         await update.message.reply_text(
-            "Send the PDF with a caption specifying the study area:\n"
-            "`Linear Algebra | Book Title | Author`\n\n"
-            "Available areas: Linear Algebra, Calculus, Factor Graphs, "
-            "Markov Processes, Estimation Theory",
+            f"📚 PDF saved at:\n`{file_path}`\n\n"
+            "Tell me: area, title, and author — I'll ingest it.\n"
+            "Or resend with caption: `Fitness | Book Title | Author`",
             parse_mode="Markdown",
         )
         return
@@ -636,10 +635,28 @@ def _make_handlers(subscriber: ResponseSubscriber):
             file_path = str(UPLOADS_DIR / f"{ts}_{file_name}")
             await tg_file.download_to_drive(file_path)
 
-            # PDF study book ingestion
-            if (doc.file_name or "").lower().endswith(".pdf"):
+            # Detect PDF by magic bytes (handles files without .pdf extension)
+            is_pdf = False
+            try:
+                with open(file_path, "rb") as _f:
+                    is_pdf = _f.read(4) == b"%PDF"
+            except Exception:
+                pass
+
+            # PDF: copy to persistent books dir and route to study ingestion
+            if is_pdf or (doc.file_name or "").lower().endswith(".pdf"):
+                books_dir = Path(config.RELAY_DIR) / "books"
+                books_dir.mkdir(exist_ok=True)
+                # Use original filename with .pdf extension
+                safe_name = re.sub(r"[^\w\-.]", "_", file_name)
+                if not safe_name.lower().endswith(".pdf"):
+                    safe_name += ".pdf"
+                persistent_path = str(books_dir / f"{ts}_{safe_name}")
+                import shutil
+                shutil.copy2(file_path, persistent_path)
+                log.info(f"PDF saved to persistent path: {persistent_path}")
                 caption = update.message.caption or ""
-                await _ingest_study_pdf(update, file_path, caption)
+                await _ingest_study_pdf(update, persistent_path, caption)
                 return
 
             caption = update.message.caption or f"Analyze: {doc.file_name}"
