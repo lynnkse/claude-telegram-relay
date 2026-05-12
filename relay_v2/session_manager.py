@@ -373,15 +373,15 @@ class SessionManagerNode:
     def _get_jsonl_state(self, session_file: Path, offset: int) -> tuple[Optional[str], Optional[str]]:
         """
         Scan assistant entries from `offset`.
-        Returns (last_text, last_assistant_type) where:
-          last_text            — text from the most recent assistant text entry
+        Returns (combined_text, last_assistant_type) where:
+          combined_text        — all assistant text blocks joined with double newline
           last_assistant_type  — content type of the very last assistant entry
                                  ("text", "tool_use", "thinking", …)
 
-        Each content block is its own JSONL line, so we can tell whether Claude
-        is mid-tool-call (last type = "tool_use") or done (last type = "text").
+        Accumulates ALL text blocks across entries so multi-step responses
+        (text → tool_use → text) are not truncated to just the final block.
         """
-        last_text: Optional[str] = None
+        text_blocks: list[str] = []
         last_assistant_type: Optional[str] = None
         try:
             if not session_file.exists():
@@ -406,17 +406,18 @@ class SessionManagerNode:
                                 if ctype == "text":
                                     text = c.get("text", "").strip()
                                     if text:
-                                        last_text = text
+                                        text_blocks.append(text)
                         else:
                             text = str(content).strip()
                             if text:
-                                last_text = text
+                                text_blocks.append(text)
                                 last_assistant_type = "text"
                     except (json.JSONDecodeError, AttributeError):
                         continue
         except Exception:
             pass
-        return last_text, last_assistant_type
+        combined = "\n\n".join(text_blocks) if text_blocks else None
+        return combined, last_assistant_type
 
     def _sessions_dir(self) -> Path:
         project_name = config.PROJECT_DIR.replace("/", "-").replace("_", "-")
