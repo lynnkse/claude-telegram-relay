@@ -332,6 +332,118 @@ def fetch_recent_messages(n: int = 20, channel: Optional[str] = None) -> str:
     return "Recent conversation (last session, for context):\n" + "\n".join(lines)
 
 
+def _search_edge(query: str, table: str, match_count: int = 5, match_threshold: float = 0.65) -> Optional[list]:
+    """
+    Call the Supabase search edge function.
+    Embeds the query server-side (OpenAI key lives in Supabase) and returns matches.
+    """
+    if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+        return None
+    url = f"{config.SUPABASE_URL.rstrip('/')}/functions/v1/search"
+    data = json.dumps({
+        "query": query[:500],
+        "table": table,
+        "match_count": match_count,
+        "match_threshold": match_threshold,
+    }).encode()
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "apikey": config.SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        log.warning(f"Search edge function failed ({table}): {e}")
+        return None
+
+
+def _fetch_all_rules() -> list[dict]:
+    """Fetch all active rules (content + keywords) from Supabase."""
+    if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+        return []
+    url = f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/rules?active=eq.true&select=content,keywords"
+    req = urllib.request.Request(url, headers={
+        "apikey": config.SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as e:
+        log.warning(f"Failed to fetch rules: {e}")
+        return []
+
+
+def fetch_relevant_rules(message_text: str) -> str:
+    """
+    Keyword-match active rules against the incoming message.
+    Returns a formatted prefix string for rules that match, or empty string.
+    """
+    rules = _fetch_all_rules()
+    if not rules:
+        return ""
+    msg_lower = message_text.lower()
+    matched = []
+    for rule in rules:
+        keywords = [kw.strip() for kw in (rule.get("keywords") or "").split(",") if kw.strip()]
+        if any(kw in msg_lower for kw in keywords):
+            matched.append(rule["content"])
+    if not matched:
+        return ""
+    return "[Rules to follow for this message]\n" + "\n".join(f"- {r}" for r in matched) + "\n\n"
+
+
+def save_rule(content: str):
+    """Insert a new rule and trigger embedding via the embed edge function. Non-blocking."""
+    def _write():
+        ok = _rest_insert("rules", {"content": content.strip()})
+        if not ok:
+            return
+        # Fetch the new row id so we can trigger embedding
+        url = (
+            f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/rules"
+            f"?content=eq.{urllib.parse.quote(content.strip())}&order=created_at.desc&limit=1&select=id"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": config.SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                rows = json.loads(resp.read().decode())
+                if not rows:
+                    return
+                row_id = rows[0]["id"]
+        except Exception as e:
+            log.warning(f"Rule fetch after insert failed: {e}")
+            return
+        # Trigger embed edge function (same format as DB webhook)
+        embed_url = f"{config.SUPABASE_URL.rstrip('/')}/functions/v1/embed"
+        embed_req = urllib.request.Request(
+            embed_url,
+            data=json.dumps({"record": {"id": row_id, "content": content.strip()}, "table": "rules"}).encode(),
+            method="POST",
+            headers={
+                "apikey": config.SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(embed_req, timeout=15) as r:
+                log.info(f"Rule saved and embedded: {content[:60]}")
+        except Exception as e:
+            log.warning(f"Rule embed failed: {e}")
+    threading.Thread(target=_write, daemon=True).start()
+
+
 def process_response(text: str, channel: str = "telegram") -> str:
     """
     Parse memory tags from Claude's response text, save them to Supabase,

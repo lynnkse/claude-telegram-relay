@@ -72,6 +72,10 @@ def _auto_decision(tool_name: str, tool_input: dict) -> str | None:
     if auto in ("0", "false", "no", "off"):
         return None
 
+    # ── MCP tools — always allow ──────────────────────────────────────────
+    if tool_name.startswith("mcp__"):
+        return "allow"
+
     # ── Always-safe read-only tools ───────────────────────────────────────
     if tool_name in ("Read", "Glob", "Grep", "LS", "NotebookRead"):
         return "allow"

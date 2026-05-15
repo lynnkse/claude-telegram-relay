@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 SessionManagerNode — Relay v2
 
@@ -222,6 +223,7 @@ class SessionManagerNode:
         self._set_pty_size(master_fd, rows, cols)
 
         env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+        env["CLAUDE_RELAY_SESSION"] = "1"
 
         proc = subprocess.Popen(
             cmd,
@@ -366,6 +368,19 @@ class SessionManagerNode:
             for conn in dead:
                 self.response_subscribers.remove(conn)
 
+    def _publish_activity(self, growing: bool):
+        payload = json.dumps({"type": "activity", "growing": growing}) + "\n"
+        payload_bytes = payload.encode()
+        with self.response_subs_lock:
+            dead = []
+            for conn in self.response_subscribers:
+                try:
+                    conn.sendall(payload_bytes)
+                except Exception:
+                    dead.append(conn)
+            for conn in dead:
+                self.response_subscribers.remove(conn)
+
     # ------------------------------------------------------------------
     # JSONL response detection
     # ------------------------------------------------------------------
@@ -447,6 +462,7 @@ class SessionManagerNode:
         _DEBOUNCE = 1.5  # seconds of silence after last "text" entry → done
 
         deadline = time.time() + _RESPONSE_TIMEOUT
+        _partial_text: Optional[str] = None  # best text seen so far, for timeout fallback
 
         if session_file is not None:
             # Known session — poll the specific file.
@@ -467,9 +483,11 @@ class SessionManagerNode:
                     activity_seen = True
                     last_file_size = current_size
                     last_activity_time = time.time()
+                    self._publish_activity(growing=True)
                     text, atype = self._get_jsonl_state(session_file, initial_size)
                     if text:
                         last_text = text
+                        _partial_text = text
                     if atype:
                         last_assistant_type = atype
 
@@ -530,9 +548,11 @@ class SessionManagerNode:
                             file_activity_seen[f] = True
                             file_last_size[f] = current_size
                             file_last_activity[f] = time.time()
+                            self._publish_activity(growing=True)
                             text, atype = self._get_jsonl_state(f, offset)
                             if text:
                                 file_last_text[f] = text
+                                _partial_text = text
                             if atype:
                                 file_last_atype[f] = atype
 
@@ -553,7 +573,10 @@ class SessionManagerNode:
                     log.warning(f"Session scan error: {e}")
 
         log.error("Timeout waiting for JSONL response")
-        return "(response timed out — please try again)"
+        if _partial_text:
+            log.warning("Returning partial text after timeout")
+            return _partial_text + "\n\n_(Response may be incomplete — timed out after 10 min.)_"
+        return "⌛ No response in 10 minutes. Claude may not have received the message. Send /restart to reset the session."
 
     # ------------------------------------------------------------------
     # Queue processor thread (state machine)
@@ -592,13 +615,17 @@ class SessionManagerNode:
                 session_file = None
                 initial_size = 0
 
+            # Prepend any semantically relevant rules to the message.
+            relevant_rules = supabase_client.fetch_relevant_rules(item.text)
+            message_text = (relevant_rules + item.text) if relevant_rules else item.text
+
             # Inject message via PTY.
             # Claude's TUI runs in raw terminal mode: Enter = \r (not \n).
             # Write in chunks to avoid PTY buffer limits (~4096 bytes) that
             # cause long messages (e.g. transcribed voice notes) to lose the
             # trailing \r, leaving the message sitting unsubmitted in the TUI.
             try:
-                encoded = item.text.encode()
+                encoded = message_text.encode()
                 chunk_size = 256
                 for i in range(0, len(encoded), chunk_size):
                     os.write(self.master_fd, encoded[i:i + chunk_size])

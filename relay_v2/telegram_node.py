@@ -302,16 +302,24 @@ async def _typing_keepalive(update: Update, context: ContextTypes.DEFAULT_TYPE, 
 _RESPONSE_TIMEOUT = 720.0  # 12 min (session_manager times out at 10 min)
 
 
-async def _wait_for_response(subscriber: ResponseSubscriber, source: str) -> str:
+async def _wait_for_response(
+    subscriber: ResponseSubscriber,
+    source: str,
+    activity_event: Optional[asyncio.Event] = None,
+) -> str:
     """Wait for next response from SessionManager with matching source."""
     deadline = asyncio.get_event_loop().time() + _RESPONSE_TIMEOUT
     while True:
         remaining = deadline - asyncio.get_event_loop().time()
         if remaining <= 0:
-            return "(no response received — timed out)"
+            return "⌛ No response in 12 minutes. Claude may be stuck. Send /restart to reset."
         try:
             msg = await asyncio.wait_for(subscriber.get(), timeout=min(remaining, 30.0))
         except asyncio.TimeoutError:
+            continue
+        if msg.get("type") == "activity":
+            if activity_event and msg.get("growing"):
+                activity_event.set()
             continue
         if msg.get("source") == source:
             return msg.get("text", "")
@@ -320,28 +328,50 @@ async def _wait_for_response(subscriber: ResponseSubscriber, source: str) -> str
 async def _status_notifier(
     update: Update,
     stop_event: asyncio.Event,
-    initial_delay: float = 30.0,
+    activity_event: Optional[asyncio.Event] = None,
+    initial_delay: float = 15.0,
     interval: float = 60.0,
 ):
-    """Send 'still working' text after initial_delay, then every interval seconds."""
+    """
+    After initial_delay, send a status message based on actual JSONL activity.
+    - No activity seen: warn that Claude may not have received the message.
+    - Activity seen: confirm Claude is working.
+    Then repeat every interval seconds with current state.
+    """
     try:
         await asyncio.wait_for(asyncio.shield(stop_event.wait()), timeout=initial_delay)
         return
     except asyncio.TimeoutError:
         pass
+    if stop_event.is_set():
+        return
+
     elapsed = int(initial_delay)
-    count = 0
+    if activity_event and activity_event.is_set():
+        msg = f"⏳ Claude is working... ({elapsed}s)"
+    else:
+        msg = "⚠️ Claude hasn't started responding — the message may not have been received."
+    try:
+        await update.effective_message.reply_text(msg)
+    except Exception:
+        pass
+
     while not stop_event.is_set():
-        count += 1
-        try:
-            await update.effective_message.reply_text(f"⏳ Still working... ({elapsed}s)")
-        except Exception:
-            pass
         try:
             await asyncio.wait_for(asyncio.shield(stop_event.wait()), timeout=interval)
             return
         except asyncio.TimeoutError:
             elapsed += int(interval)
+        if stop_event.is_set():
+            return
+        if activity_event and activity_event.is_set():
+            status = f"⏳ Claude is working... ({elapsed}s)"
+        else:
+            status = f"⚠️ Still no response from Claude ({elapsed}s) — consider /restart"
+        try:
+            await update.effective_message.reply_text(status)
+        except Exception:
+            pass
 
 
 async def _handle_and_reply(
@@ -357,17 +387,18 @@ async def _handle_and_reply(
 
     async with _get_message_lock():
         stop_typing = asyncio.Event()
+        activity_event = asyncio.Event()
         typing_task = asyncio.create_task(
             _typing_keepalive(update, context, stop_typing)
         )
         status_task = asyncio.create_task(
-            _status_notifier(update, stop_typing)
+            _status_notifier(update, stop_typing, activity_event)
         )
 
         _send_to_session_manager(text, source, user_id, media_path)
 
         try:
-            raw = await _wait_for_response(subscriber, source)
+            raw = await _wait_for_response(subscriber, source, activity_event)
         finally:
             stop_typing.set()
             for t in (typing_task, status_task):
