@@ -63,6 +63,7 @@ Deno.serve(async (req) => {
 
     const rpcName =
       table === "memory"       ? "match_memory"       :
+      table === "dreams"       ? "match_dreams"       :
       table === "autocad_docs" ? "match_autocad_docs" :
       table === "documents"    ? "match_documents"    :
       "match_messages";

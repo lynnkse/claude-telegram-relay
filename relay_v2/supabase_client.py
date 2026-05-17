@@ -37,7 +37,8 @@ _INSIGHT_RE = re.compile(
     r'\[INSIGHT:\s*(.+?)(?:\s*\|\s*PROJECT:\s*([^\|\]]+?))?(?:\s*\|\s*TYPE:\s*([^\|\]]+?))?(?:\s*\|\s*CONFIDENCE:\s*(\d))?\]',
     re.DOTALL,
 )
-_ALL_TAGS_RE = re.compile(r'\[(REMEMBER|GOAL|DONE|INSIGHT):[^\]]+\]', re.DOTALL)
+_DREAM_RE = re.compile(r'\[DREAM:\s*(.+?)\]', re.DOTALL)
+_ALL_TAGS_RE = re.compile(r'\[(REMEMBER|GOAL|DONE|INSIGHT|DREAM):[^\]]+\]', re.DOTALL)
 
 
 # ------------------------------------------------------------------
@@ -444,6 +445,66 @@ def save_rule(content: str):
     threading.Thread(target=_write, daemon=True).start()
 
 
+def save_dream(content: str, sources: list):
+    """Insert a dream into the dreams table and trigger embedding. Non-blocking."""
+    def _write():
+        ok = _rest_insert("dreams", {"content": content.strip(), "sources": sources})
+        if not ok:
+            return
+        url = (
+            f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/dreams"
+            f"?order=created_at.desc&limit=1&select=id"
+        )
+        req = urllib.request.Request(url, headers={
+            "apikey": config.SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                rows = json.loads(resp.read().decode())
+                if not rows:
+                    return
+                row_id = rows[0]["id"]
+        except Exception as e:
+            log.warning(f"Dream fetch after insert failed: {e}")
+            return
+        embed_url = f"{config.SUPABASE_URL.rstrip('/')}/functions/v1/embed"
+        embed_req = urllib.request.Request(
+            embed_url,
+            data=json.dumps({"record": {"id": row_id, "content": content.strip()}, "table": "dreams"}).encode(),
+            method="POST",
+            headers={
+                "apikey": config.SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+                "Content-Type": "application/json",
+            },
+        )
+        try:
+            with urllib.request.urlopen(embed_req, timeout=15):
+                log.info(f"Dream saved and embedded: {content[:60]}")
+        except Exception as e:
+            log.warning(f"Dream embed failed: {e}")
+    threading.Thread(target=_write, daemon=True).start()
+
+
+def fetch_relevant_dreams(query: str, match_count: int = 3, match_threshold: float = 0.60) -> str:
+    """
+    Find dreams semantically similar to the query.
+    Returns a formatted context string ready to prepend to a message, or empty string.
+    """
+    results = _search_edge(query, "dreams", match_count=match_count, match_threshold=match_threshold)
+    if not results:
+        return ""
+    lines = []
+    for r in results:
+        content = r.get("content", "").strip()
+        if content:
+            lines.append(f"- {content}")
+    if not lines:
+        return ""
+    return "[Dreams — patterns noticed during idle reflection]\n" + "\n".join(lines)
+
+
 def process_response(text: str, channel: str = "telegram") -> str:
     """
     Parse memory tags from Claude's response text, save them to Supabase,
@@ -485,6 +546,13 @@ def process_response(text: str, channel: str = "telegram") -> str:
                 confidence=conf,
                 source="auto",
             )
+
+    dreams = _DREAM_RE.findall(text)
+    for dream_content in dreams:
+        dream_content = dream_content.strip()
+        if dream_content:
+            log.info(f"Dream captured: {dream_content[:60]}")
+            save_dream(dream_content, [])
 
     # Strip all tags from delivered text
     cleaned = _ALL_TAGS_RE.sub("", text).strip()

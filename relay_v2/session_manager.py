@@ -619,6 +619,12 @@ class SessionManagerNode:
             relevant_rules = supabase_client.fetch_relevant_rules(item.text)
             message_text = (relevant_rules + item.text) if relevant_rules else item.text
 
+            # Inject semantically relevant dreams for real user messages.
+            if item.source == "telegram":
+                dream_context = supabase_client.fetch_relevant_dreams(item.text)
+                if dream_context:
+                    message_text = dream_context + "\n\n" + message_text
+
             # Inject message via PTY.
             # Claude's TUI runs in raw terminal mode: Enter = \r (not \n).
             # Write in chunks to avoid PTY buffer limits (~4096 bytes) that
