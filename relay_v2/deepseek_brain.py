@@ -317,15 +317,33 @@ class BrainServer:
             msg = json.loads(data.decode())
         except Exception:
             return
+
+        # Handle executor confirmation responses (from Telegram inline buttons)
+        if msg.get("type") == "confirm_response":
+            from executor import resolve_confirmation
+            action_id = msg.get("action_id", "")
+            approved = bool(msg.get("approved", False))
+            resolve_confirmation(action_id, approved)
+            log.info(f"Confirmation resolved: action_id={action_id} approved={approved}")
+            return
+
         text = msg.get("text", "").strip()
         user_id = str(msg.get("user_id", ""))
         if not text:
             return
 
         def send_confirm(action_id: str, summary: str):
-            # Send confirmation request as a special message via response socket
-            confirm_msg = f"⚠️ Action requested:\n{summary}\n\nReply /approve_{action_id} or /deny_{action_id}"
-            self._publish(confirm_msg, user_id)
+            payload = json.dumps({"type": "confirm_request", "action_id": action_id, "summary": summary, "user_id": user_id}) + "\n"
+            data = payload.encode()
+            with self._subs_lock:
+                dead = []
+                for s in self._response_subscribers:
+                    try:
+                        s.sendall(data)
+                    except Exception:
+                        dead.append(s)
+                for s in dead:
+                    self._response_subscribers.remove(s)
 
         def publish_intermediate(text: str):
             self._publish(text, user_id)

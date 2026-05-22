@@ -167,12 +167,14 @@ class ResponseSubscriber:
     Routes messages to two queues:
       _response_queue   — normal {text, source, user_id} messages
       _permission_queue — {type:"permission_request", tool_name, tool_input} messages
+      _confirm_queue    — {type:"confirm_request", action_id, summary} messages (executor)
     """
 
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
         self._response_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._permission_queue: asyncio.Queue[dict] = asyncio.Queue()
+        self._confirm_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._tui_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._proactive_queue: asyncio.Queue[dict] = asyncio.Queue()
         self._thread = threading.Thread(target=self._reader_thread, daemon=True)
@@ -200,7 +202,11 @@ class ResponseSubscriber:
                             continue
                         try:
                             msg = json.loads(line)
-                            if msg.get("type") == "permission_request":
+                            if msg.get("type") == "confirm_request":
+                                self._loop.call_soon_threadsafe(
+                                    self._confirm_queue.put_nowait, msg
+                                )
+                            elif msg.get("type") == "permission_request":
                                 self._loop.call_soon_threadsafe(
                                     self._permission_queue.put_nowait, msg
                                 )
@@ -232,6 +238,9 @@ class ResponseSubscriber:
 
     async def get_permission(self) -> dict:
         return await self._permission_queue.get()
+
+    async def get_confirm(self) -> dict:
+        return await self._confirm_queue.get()
 
     async def get_tui_prompt(self) -> dict:
         return await self._tui_queue.get()
@@ -519,6 +528,32 @@ async def _proactive_dispatcher(
                 await bot.send_message(chat_id=authorized_user_id, text=chunk)
             except Exception as e:
                 log.error(f"Failed to send proactive message: {e}")
+
+
+async def _confirm_dispatcher(
+    subscriber: "ResponseSubscriber",
+    bot,
+    authorized_user_id: str,
+):
+    """Background task: sends executor action confirmation requests as Telegram inline buttons."""
+    while True:
+        msg = await subscriber.get_confirm()
+        action_id = msg.get("action_id", "")
+        summary = msg.get("summary", "unknown action")
+        log.info(f"Sending confirm request to Telegram: action_id={action_id}")
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Approve", callback_data=f"exec:approve:{action_id}"),
+            InlineKeyboardButton("❌ Deny",    callback_data=f"exec:deny:{action_id}"),
+        ]])
+        try:
+            await bot.send_message(
+                chat_id=authorized_user_id,
+                text=summary,
+                parse_mode="Markdown",
+                reply_markup=keyboard,
+            )
+        except Exception as e:
+            log.error(f"Failed to send confirm request: {e}")
 
 
 async def _permission_dispatcher(
@@ -991,6 +1026,33 @@ def main():
 
         application.add_handler(CallbackQueryHandler(on_permission_callback, pattern="^perm:"))
 
+        # Executor confirm inline keyboard handler (deepseek_brain actions)
+        async def on_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+            query = update.callback_query
+            auth_ok = not AUTHORIZED_USER_ID or str(query.from_user.id) == AUTHORIZED_USER_ID
+            if auth_ok:
+                parts = query.data.split(":", 2)  # exec:approve:<id>
+                decision = parts[1] if len(parts) > 1 else "deny"
+                action_id = parts[2] if len(parts) > 2 else ""
+                approved = decision == "approve"
+                log.info(f"Executor confirm {decision} for action_id={action_id}")
+                try:
+                    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                    sock.connect(config.USER_INPUT_SOCK)
+                    payload = json.dumps({"type": "confirm_response", "action_id": action_id, "approved": approved}) + "\n"
+                    sock.sendall(payload.encode())
+                    sock.close()
+                except Exception as e:
+                    log.error(f"Failed to send confirm_response: {e}")
+            try:
+                await query.answer()
+                label = "✅ Approved" if (auth_ok and approved) else "❌ Denied"
+                await query.edit_message_text(label)
+            except Exception:
+                pass
+
+        application.add_handler(CallbackQueryHandler(on_confirm_callback, pattern="^exec:"))
+
         # TUI choice prompt inline keyboard handler
         async def on_tui_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             query = update.callback_query
@@ -1024,6 +1086,9 @@ def main():
             )
             loop.create_task(
                 _proactive_dispatcher(subscriber, application.bot, AUTHORIZED_USER_ID)
+            )
+            loop.create_task(
+                _confirm_dispatcher(subscriber, application.bot, AUTHORIZED_USER_ID)
             )
 
         log.info(f"TelegramNode starting (authorized user: {AUTHORIZED_USER_ID or 'ANY'})")
