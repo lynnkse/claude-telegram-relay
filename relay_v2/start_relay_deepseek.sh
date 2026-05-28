@@ -22,7 +22,7 @@ fi
 cd "$SCRIPT_DIR"
 
 # Use pyenv python if available (needed on machines with system python < 3.9)
-PYTHON="$(pyenv which python 2>/dev/null || which python3)"
+PYTHON="${PYTHON:-$HOME/.pyenv/versions/cognitive-hq/bin/python}"
 
 # PID lock — prevent multiple relay instances
 RELAY_LOCK="/tmp/cognitive-hq-relay.lock"

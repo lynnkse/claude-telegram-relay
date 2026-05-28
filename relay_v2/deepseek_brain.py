@@ -28,6 +28,7 @@ import os
 import socket
 import sys
 import threading
+import supabase_client
 import time
 from pathlib import Path
 from typing import Optional
@@ -50,6 +51,8 @@ ALLOWED_ROOTS: list[str] = [
     r.strip() for r in config.get("ALLOWED_ROOTS", config.PROJECT_DIR).split(",") if r.strip()
 ]
 WATCHDOG_ENABLED: bool = config.get("WATCHDOG", "0") == "1"
+SESSION_ID_FILE = "/tmp/cognitive-hq/claude_executor_session.txt"
+
 MAX_TOOL_ROUNDS = 10       # max consecutive tool calls before forcing text response
 MAX_HISTORY = 40           # messages to keep in context (older ones dropped)
 
@@ -87,65 +90,83 @@ TOOLS = [
     {
         "type": "function",
         "function": {
-            "name": "write_file",
-            "description": "Write or overwrite a file with new content. Requires user confirmation.",
+            "name": "delegate_to_claude",
+            "description": "Delegate a task to Claude for execution. Use this for ALL actions that modify state: writing files, running shell commands, SSH operations, git commits, installs, restarts, deletions, or any complex multi-step code change. Claude will execute the task, stream output to the user, and return the result. Do NOT use for reading files or listing directories.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string", "description": "Full new file content"}
+                    "request": {"type": "string", "description": "Plain-language description of what to do. Include all context: file paths, what to change, why."}
                 },
-                "required": ["path", "content"]
+                "required": ["request"]
             }
         }
     },
     {
         "type": "function",
         "function": {
-            "name": "bash",
-            "description": "Run a shell command. Requires user confirmation for anything that modifies state.",
+            "name": "query_memory",
+            "description": "Query long-term memory: facts, goals, preferences, recent messages, food log, tasks, or any stored data. Use this instead of asking the user — the answer is often already saved. Accepts raw SQL for the underlying database.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "Shell command to execute"}
+                    "sql": {"type": "string", "description": "SQL SELECT query to run against the memory database. Tables: memory, messages, personal_tasks, food_entries, fitness_log, frequent_foods, machines, insights, projects, documents."}
                 },
-                "required": ["command"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "delete_file",
-            "description": "Delete a file. Requires user confirmation.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"}
-                },
-                "required": ["path"]
+                "required": ["sql"]
             }
         }
     },
 ]
 
-SYSTEM_PROMPT = f"""You are an AI assistant with access to the user's computer via tools.
+def _build_system_prompt() -> str:
+    base = (
+        "You are an AI assistant powered by DeepSeek. "
+        "You are NOT Claude and NOT made by Anthropic - do not claim otherwise if asked. "
+        "You have access to the user's computer via tools.\n\n"
+        "CRITICAL RULES — read these first:\n"
+        "1. For greetings, simple questions, status checks, or anything you can answer from "
+        "the context already in this system prompt: respond DIRECTLY with no tool calls.\n"
+        "2. Recent conversation history and memory facts are ALREADY loaded below. "
+        "Do NOT use read_file to explore the relay codebase to answer memory questions. "
+        "Do NOT read supabase_client.py or any relay source files unless the user explicitly "
+        "asks you to look at the relay code.\n"
+        "3. To fetch fresh data from memory/Supabase, use the query_memory tool with a SQL "
+        "SELECT — do not read source files to figure out how.\n\n"
+        "You can read files freely. For writes, deletes, and shell commands the user will be "
+        "asked to confirm before anything executes - so propose actions freely, "
+        "they won't happen without approval.\n\n"
+        f"Working context:\n"
+        f"- User: {config.USER_NAME or 'Lynn'}\n"
+        f"- Allowed directories: {', '.join(ALLOWED_ROOTS)}\n"
+        f"- Timezone: {config.USER_TIMEZONE}\n\n"
+        "When working on code or files:\n"
+        "1. Use read_file / list_dir freely to understand the current state\n"
+        "2. For ANY action that changes state (write, delete, bash, SSH, git, installs): "
+        "use delegate_to_claude with a clear plain-language request\n"
+        "3. Claude will execute the action and report back - "
+        "you continue the conversation with the result\n\n"
+        "Be concise. No need to narrate every tool call - just do the work and summarize results."
+    )
+    parts = [base]
+    try:
+        mem = supabase_client.fetch_memory_context()
+        if mem:
+            parts.append(mem)
+            log.info(f"[prompt] memory loaded: {len(mem)} chars")
+        else:
+            log.warning("[prompt] memory empty or unavailable")
+        recent = supabase_client.fetch_recent_messages(n=20)
+        if recent:
+            parts.append("Recent conversation context:\n" + recent)
+            log.info(f"[prompt] recent messages loaded: {len(recent)} chars")
+        else:
+            log.warning("[prompt] recent messages empty or unavailable")
+    except Exception as e:
+        log.warning(f"Failed to load Supabase context: {e}")
+    total = len("\n\n".join(parts))
+    log.info(f"[prompt] system prompt built: {total} chars total")
+    return "\n\n".join(parts)
 
-You can read files freely. For writes, deletes, and shell commands the user will be asked to confirm before anything executes — so propose actions freely, they won't happen without approval.
 
-Working context:
-- User: {config.USER_NAME or 'Lynn'}
-- Allowed directories: {', '.join(ALLOWED_ROOTS)}
-- Timezone: {config.USER_TIMEZONE}
-
-When working on code or files:
-1. Read relevant files first to understand the current state
-2. Propose changes clearly, explaining what and why
-3. Use write_file for edits (provide the full new file content)
-4. Use bash for running tests, git commands, SSH to remote machines
-
-Be concise. No need to narrate every tool call — just do the work and summarize results.
-"""
 
 
 # ── DeepSeek client ───────────────────────────────────────────────────────────
@@ -206,7 +227,156 @@ class DeepSeekBrain:
         if len(self.history) > MAX_HISTORY:
             self.history = self.history[-MAX_HISTORY:]
 
-    def _run_tool(self, name: str, args: dict, send_confirm) -> str:
+    def _run_claude_delegate(self, request: str, publish_text) -> str:
+        """Run Claude CLI with persistent session (resume if session ID saved)."""
+        # Redirect self-serviceable requests back to DeepSeek's own tools
+        _req_lower = request.lower()
+        _self_service_keywords = [
+            'supabase', 'memory', 'messages', 'context', 'latest', 'recent',
+            'conversation', 'history', 'what have we', 'pick up', 'recall',
+            'food', 'tasks', 'goals', 'facts', 'insights', 'personal_tasks',
+        ]
+        if any(kw in _req_lower for kw in _self_service_keywords):
+            return (
+                "[redirect] This request is about memory or Supabase data - "
+                "use the query_memory tool with an appropriate SQL SELECT instead of delegating to Claude. "
+                "Example: SELECT content, role, created_at FROM messages ORDER BY created_at DESC LIMIT 50"
+            )
+        import subprocess, threading as _threading
+        claude_path = config.CLAUDE_PATH
+        cmd = [claude_path, "--print"]
+        # Resume persistent session if one exists
+        if os.path.exists(SESSION_ID_FILE):
+            session_id = open(SESSION_ID_FILE).read().strip()
+            if session_id:
+                cmd += ["--resume", session_id]
+        cmd.append(request)
+        log.info(f"Claude delegate cmd: {' '.join(str(c) for c in cmd)}")
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                cwd=config.PROJECT_DIR,
+                env={**os.environ},
+            )
+            # Drain stderr in background — log it, never forward to Telegram
+            stderr_lines: list[str] = []
+            def _drain_stderr():
+                for l in proc.stderr:
+                    stderr_lines.append(l)
+                    log.warning(f"Claude stderr: {l.rstrip()}")
+            _t = _threading.Thread(target=_drain_stderr, daemon=True)
+            _t.start()
+
+            output_lines = []
+            session_id_captured = None
+            for line in proc.stdout:
+                # Claude prints session ID as: Session ID: <id>
+                if line.startswith("Session ID:") and not session_id_captured:
+                    session_id_captured = line.split("Session ID:", 1)[1].strip()
+                output_lines.append(line)
+                publish_text(f"🔧 {line.rstrip()}")
+            proc.wait(timeout=300)
+            _t.join(timeout=5)
+            # Save session ID for next call
+            if session_id_captured:
+                with open(SESSION_ID_FILE, "w") as f:
+                    f.write(session_id_captured)
+            full_output = "".join(output_lines).strip()
+            # Log request + response to memory store
+            try:
+                supabase_client.save_message("user", f"[delegate→Claude] {request}", channel="relay_actions")
+                supabase_client.save_message("assistant", f"[Claude→DeepSeek] {full_output[:2000]}", channel="relay_actions")
+            except Exception as le:
+                log.warning(f"Failed to log delegate to DB: {le}")
+            if proc.returncode != 0:
+                return f"[Claude exited {proc.returncode}]\n{full_output}"
+            return full_output or "done"
+        except Exception as e:
+            log.error(f"Claude delegate error: {e}")
+            return f"[delegate error: {e}]"
+
+    def _run_query_memory(self, sql: str) -> str:
+        """Execute SQL against the memory database via supabase_client helpers."""
+        import re as _re
+        sql_stripped = sql.strip().upper()
+        if not sql_stripped.startswith("SELECT"):
+            return "[query_memory: only SELECT queries allowed]"
+
+        # Route well-known queries to supabase_client helpers for reliability
+        sql_lower = sql.strip().lower()
+
+        # messages table → use fetch_recent_messages
+        if _re.search(r"from\s+messages", sql_lower):
+            limit_m = _re.search(r"limit\s+(\d+)", sql_lower)
+            n = int(limit_m.group(1)) if limit_m else 50
+            n = min(n, 200)
+            try:
+                result = supabase_client.fetch_recent_messages(n=n)
+                log.info(f"[query_memory] messages: fetched n={n}, got {len(result or '')} chars")
+                return result or "(no messages)"
+            except Exception as e:
+                return f"[query_memory error fetching messages: {e}]"
+
+        # memory/facts table → use fetch_memory_context
+        if _re.search(r"from\s+(memory|facts)", sql_lower):
+            try:
+                result = supabase_client.fetch_memory_context()
+                log.info(f"[query_memory] memory: got {len(result or '')} chars")
+                return result or "(no memory)"
+            except Exception as e:
+                return f"[query_memory error fetching memory: {e}]"
+
+        # Generic fallback — PostgREST simple table fetch
+        m = _re.search(r"from\s+(\w+)", sql_lower)
+        if not m:
+            return "[query_memory: could not parse table name from SQL]"
+        table = m.group(1)
+        if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+            return "[query_memory: database not configured]"
+        import urllib.request
+        try:
+            limit_m = _re.search(r"limit\s+(\d+)", sql_lower)
+            limit = int(limit_m.group(1)) if limit_m else 50
+            req_url = f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/{table}?limit={limit}&order=created_at.desc"
+            req = urllib.request.Request(req_url, headers={
+                "apikey": config.SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+            })
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                import json as _json
+                rows = _json.loads(resp.read().decode())
+                if not rows:
+                    return f"(no rows in {table})"
+                lines = []
+                for r in rows[:50]:
+                    lines.append(", ".join(f"{k}={v}" for k, v in r.items() if v is not None))
+                log.info(f"[query_memory] {table}: {len(rows)} rows")
+                return f"{table} ({len(rows)} rows):\n" + "\n".join(lines)
+        except Exception as e:
+            return f"[query_memory error: {e}]"
+
+    RELAY_SOURCE_DIR = "/home/lynnkse/cognitive-hq/claude-telegram-relay"
+
+    def _run_tool(self, name: str, args: dict, send_confirm, publish_text=None) -> str:
+        if name == "query_memory":
+            return self._run_query_memory(args["sql"])
+        if name == "delegate_to_claude":
+            return self._run_claude_delegate(args["request"], publish_text or (lambda x: None))
+
+        # Block read_file/list_dir on relay source files — brain should never read its own code
+        if name in ("read_file", "list_dir"):
+            path = args.get("path", "")
+            if self.RELAY_SOURCE_DIR in path or path.endswith(("supabase_client.py", "deepseek_brain.py", "telegram_node.py", "executor.py", "config.py")):
+                log.warning(f"[tool] blocked {name} on relay source: {path}")
+                return (
+                    "[blocked] Do not read relay source files. "
+                    "For memory/messages: use query_memory tool. "
+                    "For current work status: it's already in the system prompt context."
+                )
+
         action = Action(id=f"{name}_{int(time.time())}", type=name, params=args)
 
         # Optional Haiku watchdog review before Telegram confirmation
@@ -229,10 +399,13 @@ class DeepSeekBrain:
         Returns final text response.
         """
         with self._lock:
+            log.info(f"[chat] incoming ({len(user_text)} chars): {user_text[:120]!r}")
             self.history.append({"role": "user", "content": user_text})
             self._trim_history()
 
-            messages = [{"role": "system", "content": SYSTEM_PROMPT}] + self.history
+            sys_prompt = _build_system_prompt()
+            messages = [{"role": "system", "content": sys_prompt}] + self.history
+            log.info(f"[chat] sending {len(messages)} messages to DeepSeek (sys={len(sys_prompt)} chars, history={len(self.history)})")
             final_text = ""
 
             for round_num in range(MAX_TOOL_ROUNDS):
@@ -241,6 +414,7 @@ class DeepSeekBrain:
                     messages=messages,
                     tools=TOOLS,
                     tool_choice="auto",
+                    timeout=90,
                 )
                 msg = response.choices[0].message
 
@@ -261,7 +435,7 @@ class DeepSeekBrain:
                     fn_name = tc.function.name
                     fn_args = json.loads(tc.function.arguments)
                     log.info(f"Tool call: {fn_name}({list(fn_args.keys())})")
-                    output = self._run_tool(fn_name, fn_args, send_confirm)
+                    output = self._run_tool(fn_name, fn_args, send_confirm, publish_text)
                     tool_results.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
@@ -273,6 +447,7 @@ class DeepSeekBrain:
             else:
                 final_text = "[max tool rounds reached — stopping]"
 
+            log.info(f"[chat] final response ({len(final_text)} chars): {final_text[:120]!r}")
             # Save final assistant turn to history
             self.history.append({"role": "assistant", "content": final_text})
             return final_text
@@ -289,6 +464,7 @@ class BrainServer:
     def _publish(self, text: str, user_id: str):
         payload = json.dumps({"text": text, "source": "deepseek", "user_id": user_id}) + "\n"
         data = payload.encode()
+        log.info(f"_publish: {len(self._response_subscribers)} sub(s), bytes={len(data)}")
         with self._subs_lock:
             dead = []
             for s in self._response_subscribers:
@@ -331,6 +507,7 @@ class BrainServer:
         user_id = str(msg.get("user_id", ""))
         if not text:
             return
+        supabase_client.save_message("user", text, channel="telegram")
 
         def send_confirm(action_id: str, summary: str):
             payload = json.dumps({"type": "confirm_request", "action_id": action_id, "summary": summary, "user_id": user_id}) + "\n"
@@ -351,6 +528,7 @@ class BrainServer:
         def run():
             try:
                 response = self.brain.chat(text, send_confirm, publish_intermediate)
+                supabase_client.save_message("assistant", response, channel="telegram")
                 self._publish(response, user_id)
             except Exception as e:
                 log.error(f"Brain error: {e}", exc_info=True)
@@ -407,5 +585,22 @@ class BrainServer:
         self._serve_user_input()  # blocks
 
 
+LOCK_FILE = "/tmp/cognitive-hq/deepseek_brain.lock"
+
+def _acquire_exclusive_lock():
+    import fcntl
+    Path(LOCK_FILE).parent.mkdir(parents=True, exist_ok=True)
+    lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.error("Another brain instance is already running (lock held). Exiting.")
+        sys.exit(1)
+    lock_fd.write(str(os.getpid()))
+    lock_fd.flush()
+    log.info(f"Exclusive lock acquired (PID {os.getpid()})")
+    return lock_fd  # keep fd open — released on process exit
+
 if __name__ == "__main__":
+    _lock_fd = _acquire_exclusive_lock()
     BrainServer().run()

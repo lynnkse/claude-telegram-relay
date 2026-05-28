@@ -330,8 +330,7 @@ async def _wait_for_response(
             if activity_event and msg.get("growing"):
                 activity_event.set()
             continue
-        if msg.get("source") == source:
-            return msg.get("text", "")
+        return msg.get("text", "")
 
 
 async def _status_notifier(

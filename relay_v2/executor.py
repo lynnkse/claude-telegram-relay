@@ -36,6 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+log = __import__("logging").getLogger(__name__)
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 # Directories the agent is allowed to read/write (resolved to absolute paths)
@@ -171,6 +173,7 @@ def _is_blocked_command(cmd: str) -> Optional[str]:
 
 def _exec_read_file(params: dict) -> tuple[bool, str, Optional[str]]:
     path = Path(params["path"])
+    log.info(f"read_file: {path}")
     reason = _is_blocked_path(path)
     if reason:
         return False, "", f"blocked: {reason}"
@@ -185,6 +188,7 @@ def _exec_read_file(params: dict) -> tuple[bool, str, Optional[str]]:
 
 def _exec_list_dir(params: dict) -> tuple[bool, str, Optional[str]]:
     path = Path(params.get("path", "."))
+    log.info(f"list_dir: {path}")
     reason = _is_blocked_path(path)
     if reason:
         return False, "", f"blocked: {reason}"
@@ -201,6 +205,7 @@ def _exec_list_dir(params: dict) -> tuple[bool, str, Optional[str]]:
 def _exec_write_file(params: dict) -> tuple[bool, str, Optional[str]]:
     path = Path(params["path"])
     content = params.get("content", "")
+    log.info(f"write_file: {path} ({len(content)} chars)")
     reason = _is_blocked_path(path)
     if reason:
         return False, "", f"blocked: {reason}"
@@ -214,6 +219,7 @@ def _exec_write_file(params: dict) -> tuple[bool, str, Optional[str]]:
 
 def _exec_delete_file(params: dict) -> tuple[bool, str, Optional[str]]:
     path = Path(params["path"])
+    log.info(f"delete_file: {path}")
     reason = _is_blocked_path(path)
     if reason:
         return False, "", f"blocked: {reason}"
@@ -228,6 +234,7 @@ def _exec_delete_file(params: dict) -> tuple[bool, str, Optional[str]]:
 
 def _exec_bash(params: dict) -> tuple[bool, str, Optional[str]]:
     cmd = params.get("command", "")
+    log.info(f"bash: {cmd[:200]}")
     reason = _is_blocked_command(cmd)
     if reason:
         return False, "", f"blocked: {reason}"
@@ -305,6 +312,10 @@ def execute(
 
     fn = _EXECUTORS[action.type]
     success, output, error = fn(action.params)
+    if success:
+        log.info(f"executor [{action.type}] OK: {output[:120].strip()!r}")
+    else:
+        log.error(f"executor [{action.type}] FAIL: {error}")
     return Result(action.id, success, output=output, error=error)
 
 
