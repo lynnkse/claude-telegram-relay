@@ -51,7 +51,6 @@ ALLOWED_ROOTS: list[str] = [
     r.strip() for r in config.get("ALLOWED_ROOTS", config.PROJECT_DIR).split(",") if r.strip()
 ]
 WATCHDOG_ENABLED: bool = config.get("WATCHDOG", "0") == "1"
-SESSION_ID_FILE = "/tmp/cognitive-hq/claude_executor_session.txt"
 
 MAX_TOOL_ROUNDS = 10       # max consecutive tool calls before forcing text response
 MAX_HISTORY = 40           # messages to keep in context (older ones dropped)
@@ -213,6 +212,132 @@ def _watchdog_review(action: Action) -> tuple[bool, str]:
         return True, f"watchdog error: {e}"
 
 
+# ── Persistent Claude executor session ───────────────────────────────────────
+
+class ClaudeExecutorSession:
+    """
+    Persistent Claude Code session used by delegate_to_claude.
+
+    Spawns session_manager.py as a subprocess with its own SOCKET_DIR so it
+    does not interfere with the main relay sockets.  Communicates via the same
+    JSON newline-delimited protocol telegram_node uses — no PTY code duplicated.
+
+    Socket dir: /tmp/cognitive-hq/claude-exec
+    """
+    SOCKET_DIR   = "/tmp/cognitive-hq/claude-exec"
+    INPUT_SOCK   = f"{SOCKET_DIR}/user_input.sock"
+    RESPONSE_SOCK = f"{SOCKET_DIR}/claude_response.sock"
+    RESPONSE_TIMEOUT = 180   # seconds to wait for Claude to reply
+
+    def __init__(self):
+        import subprocess as _sp
+        self._proc: Optional[_sp.Popen] = None
+        self._response_conn: Optional[socket.socket] = None
+        self._send_lock = threading.Lock()   # only one delegate call at a time
+        os.makedirs(self.SOCKET_DIR, exist_ok=True)
+        self._start()
+
+    def _start(self) -> None:
+        import subprocess as _sp
+        sm_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_manager.py")
+        env = {**os.environ, "SOCKET_DIR": self.SOCKET_DIR}
+        log.info(f"[claude-exec] spawning session_manager: {sm_path}")
+        self._proc = _sp.Popen(
+            [sys.executable, sm_path],
+            env=env,
+            cwd=os.path.dirname(sm_path),
+        )
+        # Wait for input socket to appear (session_manager signals readiness this way)
+        for _ in range(40):
+            if os.path.exists(self.INPUT_SOCK):
+                break
+            time.sleep(1)
+        else:
+            raise RuntimeError("[claude-exec] session_manager socket did not appear in 40s")
+        # Subscribe to the response socket (stays open — receives all messages)
+        self._subscribe_response()
+        log.info("[claude-exec] session ready")
+
+    def _subscribe_response(self) -> None:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect(self.RESPONSE_SOCK)
+        self._response_conn = s
+        # Drain any buffered startup messages
+        s.setblocking(False)
+        try:
+            while s.recv(4096):
+                pass
+        except BlockingIOError:
+            pass
+        s.setblocking(True)
+        log.info("[claude-exec] subscribed to response socket")
+
+    def _restart_if_dead(self) -> None:
+        if self._proc and self._proc.poll() is None:
+            return   # still running
+        log.warning("[claude-exec] session_manager died — restarting")
+        if self._response_conn:
+            try:
+                self._response_conn.close()
+            except Exception:
+                pass
+            self._response_conn = None
+        self._start()
+
+    def send(self, request: str, publish_text) -> str:
+        """Send request to the persistent Claude session, stream output, return final text."""
+        with self._send_lock:
+            self._restart_if_dead()
+
+            # Deliver request
+            payload = json.dumps({"text": request, "user_id": "deepseek"}) + "\n"
+            inp = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            inp.connect(self.INPUT_SOCK)
+            inp.sendall(payload.encode())
+            inp.close()
+
+            # Read from response socket until we get a final (non-growing) message
+            buf = b""
+            self._response_conn.settimeout(self.RESPONSE_TIMEOUT)
+            try:
+                while True:
+                    chunk = self._response_conn.recv(4096)
+                    if not chunk:
+                        # Socket closed — session died mid-response
+                        return "[Claude executor session closed unexpectedly]"
+                    buf += chunk
+                    while b"\n" in buf:
+                        line, buf = buf.split(b"\n", 1)
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            msg = json.loads(line.decode())
+                        except Exception:
+                            continue
+                        if msg.get("type") == "confirm_request":
+                            # Permission request from Claude — forward to user via publish_text
+                            summary = msg.get("summary", "Claude is requesting permission")
+                            publish_text(f"🔑 Claude permission request:\n{summary}")
+                            continue
+                        if msg.get("growing"):
+                            publish_text(f"🔧 {msg.get('text', '')}")
+                            continue
+                        text = msg.get("text", "")
+                        return text or "done"
+            except socket.timeout:
+                return "[Claude executor session timed out after {}s]".format(self.RESPONSE_TIMEOUT)
+
+    def close(self) -> None:
+        if self._response_conn:
+            try:
+                self._response_conn.close()
+            except Exception:
+                pass
+        if self._proc:
+            self._proc.terminate()
+
+
 # ── Brain session ─────────────────────────────────────────────────────────────
 
 class DeepSeekBrain:
@@ -221,6 +346,7 @@ class DeepSeekBrain:
         self.history: list[dict] = []
         self._lock = threading.Lock()
         configure_executor(ALLOWED_ROOTS)
+        self._claude_session = ClaudeExecutorSession()
         log.info(f"Brain ready. Model: {DEEPSEEK_MODEL}, allowed roots: {ALLOWED_ROOTS}")
 
     def _trim_history(self):
@@ -228,7 +354,7 @@ class DeepSeekBrain:
             self.history = self.history[-MAX_HISTORY:]
 
     def _run_claude_delegate(self, request: str, publish_text) -> str:
-        """Run Claude CLI with persistent session (resume if session ID saved)."""
+        """Delegate to the persistent Claude Code executor session."""
         # Redirect self-serviceable requests back to DeepSeek's own tools
         _req_lower = request.lower()
         _self_service_keywords = [
@@ -242,58 +368,15 @@ class DeepSeekBrain:
                 "use the query_memory tool with an appropriate SQL SELECT instead of delegating to Claude. "
                 "Example: SELECT content, role, created_at FROM messages ORDER BY created_at DESC LIMIT 50"
             )
-        import subprocess, threading as _threading
-        claude_path = config.CLAUDE_PATH
-        cmd = [claude_path, "--print"]
-        # Resume persistent session if one exists
-        if os.path.exists(SESSION_ID_FILE):
-            session_id = open(SESSION_ID_FILE).read().strip()
-            if session_id:
-                cmd += ["--resume", session_id]
-        cmd.append(request)
-        log.info(f"Claude delegate cmd: {' '.join(str(c) for c in cmd)}")
+        log.info(f"[delegate→Claude] {request[:120]}")
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=config.PROJECT_DIR,
-                env={**os.environ},
-            )
-            # Drain stderr in background — log it, never forward to Telegram
-            stderr_lines: list[str] = []
-            def _drain_stderr():
-                for l in proc.stderr:
-                    stderr_lines.append(l)
-                    log.warning(f"Claude stderr: {l.rstrip()}")
-            _t = _threading.Thread(target=_drain_stderr, daemon=True)
-            _t.start()
-
-            output_lines = []
-            session_id_captured = None
-            for line in proc.stdout:
-                # Claude prints session ID as: Session ID: <id>
-                if line.startswith("Session ID:") and not session_id_captured:
-                    session_id_captured = line.split("Session ID:", 1)[1].strip()
-                output_lines.append(line)
-                publish_text(f"🔧 {line.rstrip()}")
-            proc.wait(timeout=300)
-            _t.join(timeout=5)
-            # Save session ID for next call
-            if session_id_captured:
-                with open(SESSION_ID_FILE, "w") as f:
-                    f.write(session_id_captured)
-            full_output = "".join(output_lines).strip()
-            # Log request + response to memory store
+            result = self._claude_session.send(request, publish_text)
             try:
-                supabase_client.save_message("user", f"[delegate→Claude] {request}", channel="relay_actions")
-                supabase_client.save_message("assistant", f"[Claude→DeepSeek] {full_output[:2000]}", channel="relay_actions")
+                supabase_client.save_message("user",      f"[delegate→Claude] {request}",       channel="relay_actions")
+                supabase_client.save_message("assistant", f"[Claude→DeepSeek] {result[:2000]}", channel="relay_actions")
             except Exception as le:
                 log.warning(f"Failed to log delegate to DB: {le}")
-            if proc.returncode != 0:
-                return f"[Claude exited {proc.returncode}]\n{full_output}"
-            return full_output or "done"
+            return result
         except Exception as e:
             log.error(f"Claude delegate error: {e}")
             return f"[delegate error: {e}]"
