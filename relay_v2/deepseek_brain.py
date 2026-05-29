@@ -253,6 +253,12 @@ class ClaudeExecutorSession:
         log.info("[claude-exec] session ready")
 
     def _subscribe_response(self) -> None:
+        for _ in range(20):
+            if os.path.exists(self.RESPONSE_SOCK):
+                break
+            time.sleep(0.5)
+        else:
+            raise RuntimeError("[claude-exec] response socket did not appear in 10s")
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(self.RESPONSE_SOCK)
         self._response_conn = s
