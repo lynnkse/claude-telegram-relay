@@ -508,20 +508,17 @@ class DeepSeekBrain:
             return self._run_claude_delegate(args["request"], publish_text or (lambda x: None))
 
         # Block read_file/list_dir on relay source files — brain should never read its own code
-        if name in ("read_file", "list_dir"):
+        if name == "read_file":
             path = args.get("path", "")
-            # Allow reading .md files from relay dir (architecture docs are fine)
-            is_md = path.endswith(".md")
-            blocked_source = (
-                self.RELAY_SOURCE_DIR in path
-                and not is_md
-                and not path.endswith(("DEEPSEEK_ARCHITECTURE.md", "DREAMING_MODE.md", "LOCAL_AI_AGENT_SPEC.md", "TODO.md", "LOG.md"))
+            BLOCKED_FILES = (
+                "deepseek_brain.py", "session_manager.py", "telegram_node.py",
+                "executor.py", "supabase_client.py", "config.py", "permission_hook.py",
             )
-            if blocked_source or path.endswith(("supabase_client.py", "deepseek_brain.py", "telegram_node.py", "executor.py", "config.py")):
-                log.warning(f"[tool] blocked {name} on relay source: {path}")
+            if any(path.endswith(f) for f in BLOCKED_FILES):
+                log.warning(f"[tool] blocked read_file on relay source: {path}")
                 return (
                     "[blocked] Cannot read relay Python source files directly. "
-                    "MD files in relay_v2/ are readable. "
+                    "MD files (DEEPSEEK_ARCHITECTURE.md, TODO.md, LOG.md, etc.) are readable. "
                     "For memory/messages: use query_memory tool."
                 )
 
