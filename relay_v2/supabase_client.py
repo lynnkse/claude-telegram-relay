@@ -333,6 +333,49 @@ def fetch_recent_messages(n: int = 20, channel: Optional[str] = None) -> str:
     return "Recent conversation (last session, for context):\n" + "\n".join(lines)
 
 
+def fetch_recent_messages_as_turns(n: int = 30, channel: Optional[str] = None) -> list:
+    """
+    Fetch the last N messages as a list of {"role": str, "content": str} dicts.
+    Used to seed DeepSeekBrain.history on startup so conversation continuity
+    survives process restarts. No content truncation.
+    Returns [] if unavailable.
+    """
+    if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+        return []
+
+    filter_part = f"&channel=eq.{channel}" if channel else ""
+    url = (
+        f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/messages"
+        f"?select=role,content{filter_part}"
+        f"&order=created_at.desc&limit={n}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "apikey": config.SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read().decode())
+    except Exception as e:
+        log.warning(f"Failed to fetch recent messages as turns: {e}")
+        return []
+
+    if not rows:
+        return []
+
+    rows.reverse()  # oldest first
+    turns = []
+    for r in rows:
+        role = r.get("role", "").strip()
+        content = r.get("content", "").strip()
+        if role in ("user", "assistant") and content:
+            turns.append({"role": role, "content": content})
+    return turns
+
+
 def _search_edge(query: str, table: str, match_count: int = 5, match_threshold: float = 0.65) -> Optional[list]:
     """
     Call the Supabase search edge function.

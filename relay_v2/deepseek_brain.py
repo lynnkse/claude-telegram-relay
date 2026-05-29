@@ -153,12 +153,6 @@ def _build_system_prompt() -> str:
             log.info(f"[prompt] memory loaded: {len(mem)} chars")
         else:
             log.warning("[prompt] memory empty or unavailable")
-        recent = supabase_client.fetch_recent_messages(n=20)
-        if recent:
-            parts.append("Recent conversation context:\n" + recent)
-            log.info(f"[prompt] recent messages loaded: {len(recent)} chars")
-        else:
-            log.warning("[prompt] recent messages empty or unavailable")
     except Exception as e:
         log.warning(f"Failed to load Supabase context: {e}")
     total = len("\n\n".join(parts))
@@ -343,10 +337,16 @@ class ClaudeExecutorSession:
 class DeepSeekBrain:
     def __init__(self):
         self.client = _get_openai_client()
-        self.history: list[dict] = []
         self._lock = threading.Lock()
         configure_executor(ALLOWED_ROOTS)
         self._claude_session = ClaudeExecutorSession()
+        # Seed history from Supabase so conversation survives process restarts
+        try:
+            self.history = supabase_client.fetch_recent_messages_as_turns(n=30)
+            log.info(f"[init] history seeded from Supabase: {len(self.history)} turns")
+        except Exception as e:
+            log.warning(f"[init] failed to seed history: {e}")
+            self.history = []
         log.info(f"Brain ready. Model: {DEEPSEEK_MODEL}, allowed roots: {ALLOWED_ROOTS}")
 
     def _trim_history(self):
