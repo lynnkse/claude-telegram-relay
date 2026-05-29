@@ -510,12 +510,19 @@ class DeepSeekBrain:
         # Block read_file/list_dir on relay source files — brain should never read its own code
         if name in ("read_file", "list_dir"):
             path = args.get("path", "")
-            if self.RELAY_SOURCE_DIR in path or path.endswith(("supabase_client.py", "deepseek_brain.py", "telegram_node.py", "executor.py", "config.py")):
+            # Allow reading .md files from relay dir (architecture docs are fine)
+            is_md = path.endswith(".md")
+            blocked_source = (
+                self.RELAY_SOURCE_DIR in path
+                and not is_md
+                and not path.endswith(("DEEPSEEK_ARCHITECTURE.md", "DREAMING_MODE.md", "LOCAL_AI_AGENT_SPEC.md", "TODO.md", "LOG.md"))
+            )
+            if blocked_source or path.endswith(("supabase_client.py", "deepseek_brain.py", "telegram_node.py", "executor.py", "config.py")):
                 log.warning(f"[tool] blocked {name} on relay source: {path}")
                 return (
-                    "[blocked] Do not read relay source files. "
-                    "For memory/messages: use query_memory tool. "
-                    "For current work status: it's already in the system prompt context."
+                    "[blocked] Cannot read relay Python source files directly. "
+                    "MD files in relay_v2/ are readable. "
+                    "For memory/messages: use query_memory tool."
                 )
 
         action = Action(id=f"{name}_{int(time.time())}", type=name, params=args)
@@ -589,8 +596,12 @@ class DeepSeekBrain:
                 final_text = "[max tool rounds reached — stopping]"
 
             log.info(f"[chat] final response ({len(final_text)} chars): {final_text[:120]!r}")
-            # Save final assistant turn to history
-            self.history.append({"role": "assistant", "content": final_text})
+            # Only save clean responses to history — skip error/timeout artifacts
+            if final_text and not final_text.startswith(("[max tool", "[error", "[blocked", "[delegate error")):
+                self.history.append({"role": "assistant", "content": final_text})
+            else:
+                # Still append something so the user turn has a pair, but mark it minimal
+                self.history.append({"role": "assistant", "content": "(previous attempt failed — please retry)"})
             return final_text
 
 
