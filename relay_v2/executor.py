@@ -171,8 +171,13 @@ def _is_blocked_command(cmd: str) -> Optional[str]:
 
 # ── Execution ─────────────────────────────────────────────────────────────────
 
+def _get_path(params: dict) -> str:
+    """Tolerant path extractor — handles hallucinated key names like 'string', 'file', etc."""
+    return params.get("path") or params.get("file") or next(iter(params.values()), "")
+
+
 def _exec_read_file(params: dict) -> tuple[bool, str, Optional[str]]:
-    path = Path(params["path"])
+    path = Path(_get_path(params))
     log.info(f"read_file: {path}")
     reason = _is_blocked_path(path)
     if reason:
@@ -187,7 +192,7 @@ def _exec_read_file(params: dict) -> tuple[bool, str, Optional[str]]:
 
 
 def _exec_list_dir(params: dict) -> tuple[bool, str, Optional[str]]:
-    path = Path(params.get("path", "."))
+    path = Path(_get_path(params) or ".")
     log.info(f"list_dir: {path}")
     reason = _is_blocked_path(path)
     if reason:
@@ -203,7 +208,7 @@ def _exec_list_dir(params: dict) -> tuple[bool, str, Optional[str]]:
 
 
 def _exec_write_file(params: dict) -> tuple[bool, str, Optional[str]]:
-    path = Path(params["path"])
+    path = Path(_get_path(params))
     content = params.get("content", "")
     log.info(f"write_file: {path} ({len(content)} chars)")
     reason = _is_blocked_path(path)
@@ -218,7 +223,7 @@ def _exec_write_file(params: dict) -> tuple[bool, str, Optional[str]]:
 
 
 def _exec_delete_file(params: dict) -> tuple[bool, str, Optional[str]]:
-    path = Path(params["path"])
+    path = Path(_get_path(params))
     log.info(f"delete_file: {path}")
     reason = _is_blocked_path(path)
     if reason:
