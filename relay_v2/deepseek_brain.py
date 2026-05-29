@@ -363,14 +363,14 @@ class DeepSeekBrain:
         self._claude_session = ClaudeExecutorSession()
         # Load summaries for long-range context (injected into system prompt)
         try:
-            self._summaries = supabase_client.fetch_recent_summaries(n=5, channel="telegram")
+            self._summaries = supabase_client.fetch_recent_summaries(n=5, channel="deepseek")
             log.info(f"[init] loaded {len(self._summaries)} summaries")
         except Exception as e:
             log.warning(f"[init] failed to load summaries: {e}")
             self._summaries = []
         # Seed recent raw turns for immediate conversational continuity
         try:
-            self.history = supabase_client.fetch_recent_messages_as_turns(n=10, channel="telegram")
+            self.history = supabase_client.fetch_recent_messages_as_turns(n=10, channel="deepseek")
             log.info(f"[init] history seeded: {len(self.history)} turns")
         except Exception as e:
             log.warning(f"[init] failed to seed history: {e}")
@@ -381,7 +381,7 @@ class DeepSeekBrain:
         if len(self.history) > MAX_HISTORY:
             self.history = self.history[-MAX_HISTORY:]
 
-    def maybe_summarize(self, channel: str = "telegram") -> None:
+    def maybe_summarize(self, channel: str = "deepseek") -> None:
         """Summarize the last N unsummarized messages if threshold reached. Non-blocking — call in thread."""
         try:
             last_ts = supabase_client.get_last_summary_time(channel)
@@ -648,7 +648,7 @@ class BrainServer:
         user_id = str(msg.get("user_id", ""))
         if not text:
             return
-        supabase_client.save_message("user", text, channel="telegram")
+        supabase_client.save_message("user", text, channel="deepseek")
 
         def send_confirm(action_id: str, summary: str):
             payload = json.dumps({"type": "confirm_request", "action_id": action_id, "summary": summary, "user_id": user_id}) + "\n"
@@ -669,10 +669,10 @@ class BrainServer:
         def run():
             try:
                 response = self.brain.chat(text, send_confirm, publish_intermediate)
-                supabase_client.save_message("assistant", response, channel="telegram")
+                supabase_client.save_message("assistant", response, channel="deepseek")
                 self._publish(response, user_id)
                 # Summarize in background if enough new messages have accumulated
-                threading.Thread(target=self.brain.maybe_summarize, args=("telegram",), daemon=True).start()
+                threading.Thread(target=self.brain.maybe_summarize, args=("deepseek",), daemon=True).start()
             except Exception as e:
                 log.error(f"Brain error: {e}", exc_info=True)
                 self._publish(f"[error: {e}]", user_id)
