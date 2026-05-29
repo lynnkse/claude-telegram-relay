@@ -333,6 +333,117 @@ def fetch_recent_messages(n: int = 20, channel: Optional[str] = None) -> str:
     return "Recent conversation (last session, for context):\n" + "\n".join(lines)
 
 
+def fetch_recent_summaries(n: int = 5, channel: str = "telegram") -> list:
+    """
+    Fetch the last N conversation summaries for the given channel, oldest first.
+    Returns list of summary strings.
+    """
+    if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+        return []
+    url = (
+        f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/summaries"
+        f"?select=content,created_at&channel=eq.{channel}"
+        f"&order=created_at.desc&limit={n}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "apikey": config.SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read().decode())
+    except Exception as e:
+        log.warning(f"Failed to fetch summaries: {e}")
+        return []
+    rows.reverse()  # oldest first
+    return [r["content"] for r in rows if r.get("content")]
+
+
+def save_summary(channel: str, content: str, message_count: int) -> None:
+    """Insert a new summary into the summaries table."""
+    if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+        return
+    url = f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/summaries"
+    payload = json.dumps({"channel": channel, "content": content, "message_count": message_count}).encode()
+    req = urllib.request.Request(
+        url,
+        data=payload,
+        method="POST",
+        headers={
+            "apikey": config.SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+            "Content-Type": "application/json",
+            "Prefer": "return=minimal",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            pass
+    except Exception as e:
+        log.warning(f"Failed to save summary: {e}")
+
+
+def get_last_summary_time(channel: str = "telegram") -> Optional[str]:
+    """Return the created_at timestamp of the most recent summary, or None."""
+    if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+        return None
+    url = (
+        f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/summaries"
+        f"?select=created_at&channel=eq.{channel}&order=created_at.desc&limit=1"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "apikey": config.SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read().decode())
+            return rows[0]["created_at"] if rows else None
+    except Exception as e:
+        log.warning(f"Failed to get last summary time: {e}")
+        return None
+
+
+def fetch_messages_since(since_ts: Optional[str], channel: str = "telegram", limit: int = 20) -> list:
+    """
+    Fetch up to `limit` messages after `since_ts` (ISO timestamp), oldest first.
+    If since_ts is None, fetches the oldest `limit` messages in channel.
+    Returns list of {"role": str, "content": str} dicts.
+    """
+    if not config.SUPABASE_URL or not config.SUPABASE_ANON_KEY:
+        return []
+    filter_ts = f"&created_at=gt.{since_ts}" if since_ts else ""
+    url = (
+        f"{config.SUPABASE_URL.rstrip('/')}/rest/v1/messages"
+        f"?select=role,content&channel=eq.{channel}{filter_ts}"
+        f"&order=created_at.asc&limit={limit}"
+    )
+    req = urllib.request.Request(
+        url,
+        headers={
+            "apikey": config.SUPABASE_ANON_KEY,
+            "Authorization": f"Bearer {config.SUPABASE_ANON_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            rows = json.loads(resp.read().decode())
+    except Exception as e:
+        log.warning(f"Failed to fetch messages since {since_ts}: {e}")
+        return []
+    return [
+        {"role": r["role"], "content": r["content"]}
+        for r in rows
+        if r.get("role") in ("user", "assistant") and r.get("content", "").strip()
+    ]
+
+
 def fetch_recent_messages_as_turns(n: int = 30, channel: Optional[str] = None) -> list:
     """
     Fetch the last N messages as a list of {"role": str, "content": str} dicts.

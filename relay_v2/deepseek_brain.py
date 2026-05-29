@@ -116,7 +116,10 @@ TOOLS = [
     },
 ]
 
-def _build_system_prompt() -> str:
+SUMMARY_EVERY_N = 20   # summarize after every N messages saved
+
+
+def _build_system_prompt(summaries: list | None = None) -> str:
     base = (
         "You are an AI assistant powered by DeepSeek. "
         "You are NOT Claude and NOT made by Anthropic - do not claim otherwise if asked. "
@@ -155,6 +158,12 @@ def _build_system_prompt() -> str:
             log.warning("[prompt] memory empty or unavailable")
     except Exception as e:
         log.warning(f"Failed to load Supabase context: {e}")
+    if summaries:
+        summary_block = "Conversation history summaries (oldest → newest, each covers ~20 messages):\n" + "\n\n".join(
+            f"[Summary {i+1}] {s}" for i, s in enumerate(summaries)
+        )
+        parts.append(summary_block)
+        log.info(f"[prompt] {len(summaries)} summaries injected")
     total = len("\n\n".join(parts))
     log.info(f"[prompt] system prompt built: {total} chars total")
     return "\n\n".join(parts)
@@ -346,11 +355,17 @@ class DeepSeekBrain:
         self._lock = threading.Lock()
         configure_executor(ALLOWED_ROOTS)
         self._claude_session = ClaudeExecutorSession()
-        # Seed history from Supabase so conversation survives process restarts
-        # Filter to telegram channel only — other channels (relay_actions, etc.) are not conversation turns
+        # Load summaries for long-range context (injected into system prompt)
         try:
-            self.history = supabase_client.fetch_recent_messages_as_turns(n=30, channel="telegram")
-            log.info(f"[init] history seeded from Supabase: {len(self.history)} turns")
+            self._summaries = supabase_client.fetch_recent_summaries(n=5, channel="telegram")
+            log.info(f"[init] loaded {len(self._summaries)} summaries")
+        except Exception as e:
+            log.warning(f"[init] failed to load summaries: {e}")
+            self._summaries = []
+        # Seed recent raw turns for immediate conversational continuity
+        try:
+            self.history = supabase_client.fetch_recent_messages_as_turns(n=10, channel="telegram")
+            log.info(f"[init] history seeded: {len(self.history)} turns")
         except Exception as e:
             log.warning(f"[init] failed to seed history: {e}")
             self.history = []
@@ -359,6 +374,36 @@ class DeepSeekBrain:
     def _trim_history(self):
         if len(self.history) > MAX_HISTORY:
             self.history = self.history[-MAX_HISTORY:]
+
+    def maybe_summarize(self, channel: str = "telegram") -> None:
+        """Summarize the last N unsummarized messages if threshold reached. Non-blocking — call in thread."""
+        try:
+            last_ts = supabase_client.get_last_summary_time(channel)
+            msgs = supabase_client.fetch_messages_since(last_ts, channel=channel, limit=SUMMARY_EVERY_N)
+            if len(msgs) < SUMMARY_EVERY_N:
+                return
+            transcript = "\n".join(
+                f"{'User' if m['role'] == 'user' else 'Assistant'}: {m['content'][:400]}"
+                for m in msgs
+            )
+            prompt = (
+                "Summarize the following conversation in 3-5 sentences. "
+                "Be specific: mention file names, machine names, project names, decisions made, and tasks completed. "
+                "Write in past tense as a factual record.\n\n" + transcript
+            )
+            response = self.client.chat.completions.create(
+                model=DEEPSEEK_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=300,
+                timeout=30,
+            )
+            summary_text = response.choices[0].message.content.strip()
+            supabase_client.save_summary(channel, summary_text, len(msgs))
+            # Refresh in-memory summaries so next system prompt includes this one
+            self._summaries = supabase_client.fetch_recent_summaries(n=5, channel=channel)
+            log.info(f"[summary] saved ({len(msgs)} msgs): {summary_text[:100]}")
+        except Exception as e:
+            log.warning(f"[summary] failed: {e}")
 
     def _run_claude_delegate(self, request: str, publish_text) -> str:
         """Delegate to the persistent Claude Code executor session."""
@@ -493,7 +538,7 @@ class DeepSeekBrain:
             self.history.append({"role": "user", "content": user_text})
             self._trim_history()
 
-            sys_prompt = _build_system_prompt()
+            sys_prompt = _build_system_prompt(self._summaries)
             messages = [{"role": "system", "content": sys_prompt}] + self.history
             log.info(f"[chat] sending {len(messages)} messages to DeepSeek (sys={len(sys_prompt)} chars, history={len(self.history)})")
             final_text = ""
@@ -620,6 +665,8 @@ class BrainServer:
                 response = self.brain.chat(text, send_confirm, publish_intermediate)
                 supabase_client.save_message("assistant", response, channel="telegram")
                 self._publish(response, user_id)
+                # Summarize in background if enough new messages have accumulated
+                threading.Thread(target=self.brain.maybe_summarize, args=("telegram",), daemon=True).start()
             except Exception as e:
                 log.error(f"Brain error: {e}", exc_info=True)
                 self._publish(f"[error: {e}]", user_id)
