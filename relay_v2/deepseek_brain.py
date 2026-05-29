@@ -563,11 +563,10 @@ class DeepSeekBrain:
                 )
                 msg = response.choices[0].message
 
-                # Accumulate any text content
+                # Accumulate any text content — don't publish intermediate messages,
+                # Telegram typing indicator already shows the user something is happening
                 if msg.content:
                     final_text = msg.content
-                    if round_num > 0:
-                        publish_text(f"_{msg.content}_")
 
                 # No tool calls → done
                 if not msg.tool_calls:
