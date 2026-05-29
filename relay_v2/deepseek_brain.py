@@ -347,8 +347,9 @@ class DeepSeekBrain:
         configure_executor(ALLOWED_ROOTS)
         self._claude_session = ClaudeExecutorSession()
         # Seed history from Supabase so conversation survives process restarts
+        # Filter to telegram channel only — other channels (relay_actions, etc.) are not conversation turns
         try:
-            self.history = supabase_client.fetch_recent_messages_as_turns(n=30)
+            self.history = supabase_client.fetch_recent_messages_as_turns(n=30, channel="telegram")
             log.info(f"[init] history seeded from Supabase: {len(self.history)} turns")
         except Exception as e:
             log.warning(f"[init] failed to seed history: {e}")
