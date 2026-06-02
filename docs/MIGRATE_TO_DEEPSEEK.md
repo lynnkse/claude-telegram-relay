@@ -27,7 +27,7 @@ git pull origin deepseek-relay
 Open `.env` and add at the bottom:
 
 ```
-DEEPSEEK_API_KEY=sk-c200f3ed016b4509ada90945b5c1aa4a
+DEEPSEEK_API_KEY=sk-...your-key-here...
 DEEPSEEK_MODEL=deepseek-chat
 ALLOWED_ROOTS=/home/lynnkse/cognitive-hq,/home/lynnkse/.claude-relay
 ```
