@@ -114,6 +114,20 @@ TOOLS = [
             }
         }
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "load_skill",
+            "description": "Load full instructions for a named skill. The system prompt lists available skills with one-line descriptions. Call this when the user's message triggers a skill — before following its protocol.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Skill name as listed in the system prompt skills index (e.g. 'fitness_protocol', 'russia_tracker')"}
+                },
+                "required": ["name"]
+            }
+        }
+    },
 ]
 
 SUMMARY_EVERY_N = 20   # summarize after every N messages saved
@@ -155,6 +169,13 @@ def _build_system_prompt(summaries: list | None = None) -> str:
         "Be concise. No need to narrate every tool call - just do the work and summarize results."
     )
     parts = [base]
+    try:
+        skills_index = supabase_client.fetch_skills_index()
+        if skills_index:
+            parts.append(skills_index)
+            log.info(f"[prompt] skills index loaded: {len(skills_index)} chars")
+    except Exception as e:
+        log.warning(f"Failed to load skills index: {e}")
     try:
         mem = supabase_client.fetch_memory_context()
         if mem:
@@ -502,6 +523,10 @@ class DeepSeekBrain:
     RELAY_SOURCE_DIR = "/home/lynnkse/cognitive-hq/claude-telegram-relay"
 
     def _run_tool(self, name: str, args: dict, send_confirm, publish_text=None) -> str:
+        if name == "load_skill":
+            skill_name = args.get("name", "")
+            log.info(f"[tool] load_skill: {skill_name}")
+            return supabase_client.fetch_skill_by_name(skill_name)
         if name == "query_memory":
             return self._run_query_memory(args["sql"])
         if name == "delegate_to_claude":
@@ -608,12 +633,21 @@ class BrainServer:
         self.brain = DeepSeekBrain()
         self._response_subscribers: list[socket.socket] = []
         self._subs_lock = threading.Lock()
+        # Buffer for responses that had no subscribers at publish time.
+        # Delivered immediately when the next subscriber connects.
+        self._pending_payloads: list[bytes] = []
+        self._pending_lock = threading.Lock()
 
     def _publish(self, text: str, user_id: str):
         payload = json.dumps({"text": text, "source": "deepseek", "user_id": user_id}) + "\n"
         data = payload.encode()
-        log.info(f"_publish: {len(self._response_subscribers)} sub(s), bytes={len(data)}")
         with self._subs_lock:
+            if not self._response_subscribers:
+                log.warning(f"_publish: no subscribers — buffering response ({len(data)} bytes)")
+                with self._pending_lock:
+                    self._pending_payloads.append(data)
+                return
+            log.info(f"_publish: {len(self._response_subscribers)} sub(s), bytes={len(data)}")
             dead = []
             for s in self._response_subscribers:
                 try:
@@ -622,8 +656,23 @@ class BrainServer:
                     dead.append(s)
             for s in dead:
                 self._response_subscribers.remove(s)
+            # If all sends failed, buffer for the next subscriber
+            if dead and not self._response_subscribers:
+                log.warning(f"_publish: all subscribers dead — buffering response")
+                with self._pending_lock:
+                    self._pending_payloads.append(data)
 
     def _handle_response_subscriber(self, conn: socket.socket):
+        # Flush any buffered responses to the new subscriber immediately
+        with self._pending_lock:
+            pending = list(self._pending_payloads)
+            self._pending_payloads.clear()
+        for data in pending:
+            try:
+                conn.sendall(data)
+                log.info(f"Flushed buffered response to new subscriber ({len(data)} bytes)")
+            except Exception as e:
+                log.warning(f"Failed to flush buffered response: {e}")
         with self._subs_lock:
             self._response_subscribers.append(conn)
         # Keep connection open until client disconnects

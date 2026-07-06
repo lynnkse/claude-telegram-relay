@@ -10,7 +10,10 @@
       "LS(*)",
       "WebFetch(*)",
       "WebSearch(*)",
-      "mcp__*__*",
+      "mcp__supabase__*",
+      "mcp__autocad-search__*",
+      "mcp__glm-agent__*",
+      "mcp__study-search__*",
       "Agent(*)"
     ]
   },

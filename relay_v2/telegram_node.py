@@ -225,13 +225,13 @@ class ResponseSubscriber:
                         except json.JSONDecodeError as e:
                             log.warning(f"Bad response JSON: {e}")
             except Exception as e:
-                log.warning(f"claude_response.sock error: {e} — retrying in 3s")
+                log.warning(f"claude_response.sock error: {e} — retrying in 0.5s")
             finally:
                 try:
                     sock.close()
                 except Exception:
                     pass
-            time.sleep(3)
+            time.sleep(0.5)
 
     async def get(self) -> dict:
         return await self._response_queue.get()
@@ -392,6 +392,13 @@ async def _handle_and_reply(
 ):
     """Common handler: send to SessionManager, keepalive, deliver response."""
     user_id = str(update.effective_user.id)
+
+    # Send typing immediately — before waiting for the lock, so the user always
+    # sees the indicator even if a previous message is still being processed.
+    try:
+        await update.effective_message.reply_chat_action("typing")
+    except Exception:
+        pass
 
     async with _get_message_lock():
         stop_typing = asyncio.Event()
@@ -590,6 +597,80 @@ async def _permission_dispatcher(
             _send_permission_response("deny")
 
 
+# ── Knowledge base ingestion ──────────────────────────────────────────────────
+
+_KB_INGEST_SCRIPT = Path(__file__).parent / "kb_ingest.py"
+_KB_TRIGGER_RE = re.compile(r"knowledge\s*base", re.IGNORECASE)
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _is_kb_request(caption: str) -> bool:
+    return bool(_KB_TRIGGER_RE.search(caption or ""))
+
+
+def _parse_kb_caption(caption: str, default_title: str) -> dict:
+    """Caption format: "...knowledge base... | Title | Author | Category" (all after the trigger optional)."""
+    cleaned = _KB_TRIGGER_RE.sub("", caption or "").strip(" |").strip()
+    parts = [p.strip() for p in cleaned.split("|")] if cleaned else []
+    return {
+        "title": parts[0] if parts and parts[0] else default_title,
+        "author": parts[1] if len(parts) > 1 else "",
+        "category": parts[2] if len(parts) > 2 else "general",
+    }
+
+
+async def _ingest_kb(update: Update, kind: str, source: str, caption: str, default_title: str):
+    """Run kb_ingest.py for a PDF/PPTX/image/link. kind is one of pdf/pptx/image/link."""
+    meta = _parse_kb_caption(caption, default_title)
+
+    await update.message.reply_text(
+        f"Adding to knowledge base: *{meta['title']}*...\nThis may take a minute.",
+        parse_mode="Markdown",
+    )
+
+    env = os.environ.copy()
+    env["SUPABASE_URL"] = config.SUPABASE_URL
+    env["SUPABASE_ANON_KEY"] = config.SUPABASE_ANON_KEY
+    env["CLAUDE_PATH"] = config.CLAUDE_PATH
+
+    cmd = [
+        sys.executable, str(_KB_INGEST_SCRIPT),
+        f"--{kind}", source,
+        "--title", meta["title"],
+        "--category", meta["category"],
+    ]
+    if meta["author"]:
+        cmd += ["--author", meta["author"]]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=env,
+        )
+        stdout, _ = await proc.communicate()
+        output = stdout.decode(errors="replace")
+        log.info(f"kb_ingest output:\n{output[-1000:]}")
+        if proc.returncode == 0:
+            lines = [l for l in output.splitlines() if any(
+                kw in l for kw in ["complete", "Chunks", "Errors", "Title"]
+            )]
+            summary = "\n".join(lines[-6:]) if lines else "Done."
+            await update.message.reply_text(f"✅ Added to knowledge base\n{summary}")
+        else:
+            await update.message.reply_text(f"❌ Knowledge base ingestion failed:\n{output[-500:]}")
+    except Exception as e:
+        log.error(f"kb_ingest error: {e}")
+        await update.message.reply_text(f"❌ Error running knowledge base ingestion: {e}")
+    finally:
+        if kind in ("pdf", "pptx", "image"):
+            try:
+                os.unlink(source)
+            except Exception:
+                pass
+
+
 # ── PDF study ingestion ───────────────────────────────────────────────────────
 
 _INGEST_SCRIPT = Path(__file__).parent / "study_ingest.py"
@@ -673,6 +754,18 @@ def _make_handlers(subscriber: ResponseSubscriber):
             return
         text = update.message.text
         log.info(f"Text from {update.effective_user.id}: {text[:60]}")
+
+        if _is_kb_request(text):
+            url_match = _URL_RE.search(text)
+            if url_match:
+                await _ingest_kb(update, "link", url_match.group(0), text, url_match.group(0))
+                return
+            await update.message.reply_text(
+                "Got the 'knowledge base' request but no link found in the message — "
+                "send a PDF/slides/image as an attachment, or include a URL in the text."
+            )
+            return
+
         await _handle_and_reply(update, context, subscriber, text)
 
     async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -719,8 +812,13 @@ def _make_handlers(subscriber: ResponseSubscriber):
             ts = int(time.time() * 1000)
             file_path = str(UPLOADS_DIR / f"image_{ts}.jpg")
             await tg_file.download_to_drive(file_path)
-            caption = update.message.caption or "Analyze this image."
-            text = f"[Image: {file_path}]\n\n{caption}"
+            caption = update.message.caption or ""
+
+            if _is_kb_request(caption):
+                await _ingest_kb(update, "image", file_path, caption, f"image_{ts}")
+                return
+
+            text = f"[Image: {file_path}]\n\n{caption or 'Analyze this image.'}"
             await _handle_and_reply(update, context, subscriber, text, media_path=file_path)
         except Exception as e:
             log.error(f"Photo error: {e}")
@@ -747,9 +845,19 @@ def _make_handlers(subscriber: ResponseSubscriber):
                     is_pdf = _f.read(4) == b"%PDF"
             except Exception:
                 pass
+            is_pdf = is_pdf or (doc.file_name or "").lower().endswith(".pdf")
+            is_pptx = (doc.file_name or "").lower().endswith((".pptx", ".ppt"))
+
+            caption = update.message.caption or ""
+
+            # Explicit "knowledge base" request takes priority over study ingestion
+            if _is_kb_request(caption) and (is_pdf or is_pptx):
+                kind = "pdf" if is_pdf else "pptx"
+                await _ingest_kb(update, kind, file_path, caption, Path(file_name).stem)
+                return
 
             # PDF: copy to persistent books dir and route to study ingestion
-            if is_pdf or (doc.file_name or "").lower().endswith(".pdf"):
+            if is_pdf:
                 books_dir = Path(config.RELAY_DIR) / "books"
                 books_dir.mkdir(exist_ok=True)
                 # Use original filename with .pdf extension
